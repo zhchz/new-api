@@ -1,5 +1,14 @@
 .github
 .git
+.codex/
+.codex-sync/
+.env
+data/
+logs/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
 *.md
 .vscode
 .gitignore

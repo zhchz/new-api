@@ -372,5 +372,70 @@ class CodexConfigurationTests(unittest.TestCase):
             self.assertEqual(config.read_text(), 'model = "existing"\n')
 
 
+class DockerDeploymentTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        source = Path(__file__).resolve().parent
+        for name in ("deploy-codex-sync.sh", "sync-codex-models.sh",
+                     "configure_codex_sync.py"):
+            (bin_dir / name).write_bytes((source / name).read_bytes())
+            if name.endswith(".sh"):
+                (bin_dir / name).chmod(0o700)
+        key = self.root / ".codex-sync/config/api-key"
+        key.parent.mkdir(parents=True)
+        key.write_text("test-gateway-token\n")
+        self.calls = self.root / "calls"
+        docker = self.root / "docker"
+        docker.write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$*" >> "$MOCK_CALLS"\n'
+            'case "$*" in\n'
+            '  "compose config --format json") printf \'{"services":{"new-api":{"image":"new-api:test"}}}\\n\' ;;\n'
+            '  "compose ps -q new-api") printf "container-id\\n" ;;\n'
+            '  inspect*) printf "healthy\\n" ;;\n'
+            '  build*) exit "${MOCK_BUILD_STATUS:-0}" ;;\n'
+            'esac\n'
+        )
+        docker.chmod(0o700)
+        self.environment = {
+            **os.environ,
+            "PATH": str(self.root) + os.pathsep + os.environ["PATH"],
+            "CODEX_HOME": str(self.root / "codex-home"),
+            "MOCK_CALLS": str(self.calls),
+        }
+
+    def test_deploy_builds_before_replacing_gateway_without_touching_dependencies(self):
+        result = subprocess.run(
+            ["bash", str(self.root / "bin/deploy-codex-sync.sh")],
+            env=self.environment, text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls.read_text().splitlines()
+        self.assertEqual(calls[:5], [
+            "compose config --format json",
+            "build --pull -t new-api:test .",
+            "compose up -d --no-deps --force-recreate new-api",
+            "compose ps -q new-api",
+            "inspect -f {{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}} container-id",
+        ])
+        self.assertEqual(calls[5], "compose --profile codex up -d --no-deps --force-recreate codex-model-sync")
+        self.assertTrue(calls[6].startswith("compose run --rm --no-deps -T codex-model-sync "))
+
+    def test_failed_build_keeps_running_gateway_untouched(self):
+        self.environment["MOCK_BUILD_STATUS"] = "17"
+        result = subprocess.run(
+            ["bash", str(self.root / "bin/deploy-codex-sync.sh")],
+            env=self.environment, text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 17)
+        self.assertEqual(self.calls.read_text().splitlines(), [
+            "compose config --format json",
+            "build --pull -t new-api:test .",
+        ])
+
+
 if __name__ == "__main__":
     unittest.main()
