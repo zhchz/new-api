@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -16,11 +17,18 @@ import (
 )
 
 var (
-	Port         = flag.Int("port", 3000, "the listening port")
+	Port         = flag.Int("port", defaultListeningPort(), "the listening port")
 	PrintVersion = flag.Bool("version", false, "print version and exit")
 	PrintHelp    = flag.Bool("help", false, "print help and exit")
 	LogDir       = flag.String("log-dir", "./logs", "specify the log directory")
 )
+
+func defaultListeningPort() int {
+	if runtime.GOOS == "windows" {
+		return 9900
+	}
+	return 3000
+}
 
 func printHelp() {
 	fmt.Println("NewAPI(Based OneAPI) " + Version + " - The next-generation LLM gateway and AI asset management system supports multiple languages.")

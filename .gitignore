@@ -15,6 +15,7 @@ web/dist
 web/node_modules
 .env
 .codex-sync/
+.codex/newapi.env
 one-api
 new-api
 /__debug_bin*
