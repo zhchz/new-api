@@ -103,6 +103,33 @@ class ModelSyncTests(unittest.TestCase):
         )
         self.assertEqual(unknown["supported_reasoning_levels"], [])
 
+    def test_documented_gpt_efforts_fill_missing_template_levels(self):
+        models = ["gpt-5.5", "gpt-5.6", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
+                  "gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-reserve"]
+        template = {"models": [
+            {"slug": "gpt-6-astra", "default_reasoning_level": "none",
+             "supported_reasoning_levels": []},
+            {"slug": "gpt-5.6", "default_reasoning_level": "none",
+             "supported_reasoning_levels": [{"effort": "high", "description": "Custom"}]},
+            {"slug": "gpt-reserve", "default_reasoning_level": "high",
+             "supported_reasoning_levels": [{"effort": "high", "description": "Custom"}]},
+        ]}
+        catalog = {model["slug"]: model for model in build_catalog(models, template)["models"]}
+        self.assertEqual([level["effort"] for level in catalog["gpt-5.5"]["supported_reasoning_levels"]],
+                         ["none", "low", "medium", "high", "xhigh"])
+        for name in ("gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
+                     "gpt-6-luna", "gpt-6-sol"):
+            self.assertEqual([level["effort"] for level in catalog[name]["supported_reasoning_levels"]],
+                             ["none", "low", "medium", "high", "xhigh", "max"])
+        self.assertEqual([level["effort"] for level in catalog["gpt-6-astra"]["supported_reasoning_levels"]],
+                         ["low", "medium", "high", "xhigh", "max"])
+        self.assertEqual(catalog["gpt-6-astra"]["default_reasoning_level"], "medium")
+        self.assertEqual([level["effort"] for level in catalog["gpt-5.6"]["supported_reasoning_levels"]],
+                         ["high"])
+        self.assertEqual(catalog["gpt-5.6"]["default_reasoning_level"], "high")
+        self.assertEqual(catalog["gpt-reserve"]["supported_reasoning_levels"],
+                         [{"effort": "high", "description": "Custom"}])
+
     def test_failure_preserves_catalog_and_success_timestamp(self):
         sync_once(self.base_url, self.key, self.output)
         original = self.output.read_bytes()

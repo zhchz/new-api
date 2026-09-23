@@ -214,7 +214,7 @@ Windows 直接启动 `newapi.exe` 时，程序会从 exe 所在目录的 `.codex
 
 可选的 `codex-model-sync` Compose 服务在启动时同步一次，之后每小时调用网关的 `/v1/models`，将当前网关 Key 可见的模型同步为 Codex 本地模型目录。仅当目录内容发生变化时才写入，未变化时保留文件内容和修改时间。显式声明不支持 Responses 的模型不会出现在目录中；模型删除也会同步。请求失败时保留上次成功的目录，不会写入 API Key。
 
-`step-5-preview` 的目录元数据提供 `low`、`medium`、`high` 三档思考强度，默认为 `medium`；其他未知模型仍不推断其推理能力。
+已确认能力的 GPT 模型会在目录中提供各自支持的思考强度：`gpt-5.5` 提供 `none` 至 `xhigh`，`gpt-5.6` 与 `gpt-6-sol/luna` 提供 `none` 至 `max`，`gpt-6-astra` 提供 `low` 至 `max`。现有模板显式定义的档位仍会保留；其他未知模型不推断其推理能力。目录里的选项需要上游模型实际支持，更新目录后重启 Codex 才能看到。
 
 启用前创建 `.codex-sync/config` 和 `.codex-sync/catalog`，将网关 Key 保存到 `.codex-sync/config/api-key`（权限 `600`），将现有 Codex 模型目录复制为 `.codex-sync/config/template.json`；没有目录时使用 `{"models":[]}`。模板按模型 ID 保留上下文、推理能力等元数据，未知模型使用保守默认值，不推断其能力。上述本地文件均不进入版本控制。
 

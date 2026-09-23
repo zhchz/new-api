@@ -93,7 +93,53 @@ func TestSyncCodexModelCatalog(t *testing.T) {
 	afterFailure, err := os.ReadFile(outputPath)
 	require.NoError(t, err)
 	assert.Equal(t, updated, afterFailure)
+}
 
+func TestSyncCodexModelCatalogAddsDocumentedReasoningEfforts(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"gpt-5.5"},{"id":"gpt-5.6"},{"id":"gpt-5.6-luna"},{"id":"gpt-6-astra"},{"id":"gpt-6-sol"},{"id":"gpt-reserve"}]}`))
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	keyPath := filepath.Join(root, "newapi.env")
+	outputPath := filepath.Join(root, "models.json")
+	require.NoError(t, os.WriteFile(keyPath, []byte("NEW_API_KEY=test-gateway-token\n"), 0600))
+	require.NoError(t, os.WriteFile(outputPath, []byte(`{"models":[{"slug":"gpt-6-astra","default_reasoning_level":"none","supported_reasoning_levels":[]},{"slug":"gpt-5.6","default_reasoning_level":"none","supported_reasoning_levels":[{"effort":"high","description":"Custom"}]},{"slug":"gpt-reserve","default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"high","description":"Custom"}]}]}`), 0600))
+	count, changed, err := syncCodexModelCatalog(context.Background(), server.Client(), server.URL+"/v1", keyPath, filepath.Join(root, "missing-template.json"), outputPath)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	assert.Equal(t, 6, count)
+	content, err := os.ReadFile(outputPath)
+	require.NoError(t, err)
+	var catalog struct {
+		Models []map[string]any `json:"models"`
+	}
+	require.NoError(t, common.Unmarshal(content, &catalog))
+	byName := make(map[string]map[string]any, len(catalog.Models))
+	for _, profile := range catalog.Models {
+		byName[profile["slug"].(string)] = profile
+	}
+	cases := []struct {
+		name    string
+		efforts []string
+	}{
+		{"gpt-5.5", []string{"none", "low", "medium", "high", "xhigh"}},
+		{"gpt-5.6", []string{"high"}},
+		{"gpt-5.6-luna", []string{"none", "low", "medium", "high", "xhigh", "max"}},
+		{"gpt-6-astra", []string{"low", "medium", "high", "xhigh", "max"}},
+		{"gpt-6-sol", []string{"none", "low", "medium", "high", "xhigh", "max"}},
+		{"gpt-reserve", []string{"high"}},
+	}
+	for _, test := range cases {
+		var efforts []string
+		for _, value := range byName[test.name]["supported_reasoning_levels"].([]any) {
+			efforts = append(efforts, value.(map[string]any)["effort"].(string))
+		}
+		assert.Equal(t, test.efforts, efforts, test.name)
+	}
+	assert.Equal(t, "medium", byName["gpt-6-astra"]["default_reasoning_level"])
+	assert.Equal(t, "high", byName["gpt-5.6"]["default_reasoning_level"])
+	assert.Equal(t, "high", byName["gpt-reserve"]["default_reasoning_level"])
 }
 
 func TestSyncCodexModelCatalogRejectsInvalidResponse(t *testing.T) {

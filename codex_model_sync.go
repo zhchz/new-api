@@ -205,6 +205,55 @@ func syncCodexModelCatalog(ctx context.Context, client *http.Client, baseURL, ke
 				}
 			}
 		}
+		var documentedEfforts []string
+		switch name {
+		case "gpt-5.5":
+			documentedEfforts = []string{"none", "low", "medium", "high", "xhigh"}
+		case "gpt-5.6", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
+			"gpt-6-luna", "gpt-6-sol":
+			documentedEfforts = []string{"none", "low", "medium", "high", "xhigh", "max"}
+		case "gpt-6-astra":
+			documentedEfforts = []string{"low", "medium", "high", "xhigh", "max"}
+		}
+		if len(documentedEfforts) > 0 {
+			levels, ok := profile["supported_reasoning_levels"].([]any)
+			availableEfforts := documentedEfforts
+			if ok && len(levels) > 0 {
+				availableEfforts = make([]string, 0, len(levels))
+				for _, value := range levels {
+					level, valid := value.(map[string]any)
+					if !valid {
+						return 0, false, errors.New("invalid catalog reasoning level")
+					}
+					effort, valid := level["effort"].(string)
+					if !valid || effort == "" {
+						return 0, false, errors.New("invalid catalog reasoning level")
+					}
+					availableEfforts = append(availableEfforts, effort)
+				}
+			} else {
+				descriptions := map[string]string{
+					"none":   "No reasoning",
+					"low":    "Faster responses with lighter reasoning",
+					"medium": "Balanced reasoning for everyday tasks",
+					"high":   "Deeper reasoning for complex tasks",
+					"xhigh":  "Extended reasoning for difficult tasks",
+					"max":    "Maximum reasoning for the hardest tasks",
+				}
+				levels := make([]map[string]string, 0, len(documentedEfforts))
+				for _, effort := range documentedEfforts {
+					levels = append(levels, map[string]string{"effort": effort, "description": descriptions[effort]})
+				}
+				profile["supported_reasoning_levels"] = levels
+			}
+			if selected, ok := profile["default_reasoning_level"].(string); !ok || !slices.Contains(availableEfforts, selected) {
+				if slices.Contains(availableEfforts, "medium") {
+					profile["default_reasoning_level"] = "medium"
+				} else {
+					profile["default_reasoning_level"] = availableEfforts[0]
+				}
+			}
+		}
 		profile["visibility"] = "list"
 		profile["supported_in_api"] = true
 		profile["priority"] = priority

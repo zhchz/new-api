@@ -12,6 +12,26 @@ import urllib.parse
 import urllib.request
 
 
+DOCUMENTED_REASONING_EFFORTS = {
+    "gpt-5.5": ("none", "low", "medium", "high", "xhigh"),
+    "gpt-5.6": ("none", "low", "medium", "high", "xhigh", "max"),
+    "gpt-5.6-luna": ("none", "low", "medium", "high", "xhigh", "max"),
+    "gpt-5.6-sol": ("none", "low", "medium", "high", "xhigh", "max"),
+    "gpt-5.6-terra": ("none", "low", "medium", "high", "xhigh", "max"),
+    "gpt-6-astra": ("low", "medium", "high", "xhigh", "max"),
+    "gpt-6-luna": ("none", "low", "medium", "high", "xhigh", "max"),
+    "gpt-6-sol": ("none", "low", "medium", "high", "xhigh", "max"),
+}
+REASONING_EFFORT_DESCRIPTIONS = {
+    "none": "No reasoning",
+    "low": "Faster responses with lighter reasoning",
+    "medium": "Balanced reasoning for everyday tasks",
+    "high": "Deeper reasoning for complex tasks",
+    "xhigh": "Extended reasoning for difficult tasks",
+    "max": "Maximum reasoning for the hardest tasks",
+}
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, response, code, message, headers, new_url):
         return None
@@ -100,6 +120,16 @@ def build_catalog(names, template):
                     {"effort": "medium", "description": "Balanced reasoning for everyday tasks"},
                     {"effort": "high", "description": "Deeper reasoning for complex tasks"},
                 ]
+        documented_efforts = DOCUMENTED_REASONING_EFFORTS.get(name)
+        if documented_efforts:
+            if not profile.get("supported_reasoning_levels"):
+                profile["supported_reasoning_levels"] = [
+                    {"effort": effort, "description": REASONING_EFFORT_DESCRIPTIONS[effort]}
+                    for effort in documented_efforts
+                ]
+            available = [level["effort"] for level in profile["supported_reasoning_levels"]]
+            if profile.get("default_reasoning_level") not in available:
+                profile["default_reasoning_level"] = "medium" if "medium" in available else available[0]
         profile.update(visibility="list", supported_in_api=True, priority=priority)
         models.append(profile)
     return {"models": models}
