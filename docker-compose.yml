@@ -2,7 +2,7 @@
 # 
 # Quick Start:
 #   1. docker-compose up -d
-#   2. Access at http://localhost:3000
+#   2. Access at http://localhost:9000
 #
 # Using MySQL instead of PostgreSQL:
 #   1. Comment out the postgres service and SQL_DSN line 15
@@ -21,7 +21,7 @@ services:
     restart: always
     command: --log-dir /app/logs
     ports:
-      - "3000:3000"
+      - "127.0.0.1:9000:3000"
     volumes:
       - ./data:/data
       - ./logs:/app/logs
@@ -63,6 +63,43 @@ services:
       test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/status | grep -o '\"success\":\\s*true' || exit 1"]
       interval: 30s
       timeout: 10s
+      retries: 3
+
+  codex-model-sync:
+    image: python:3.13-alpine@sha256:79e7a9b9ff1cbceff819f856fb374477792a5967759d94df266de7b7b4120e6f
+    profiles: ["codex"]
+    restart: unless-stopped
+    user: "${CODEX_SYNC_UID:-1000}:${CODEX_SYNC_GID:-1000}"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    command:
+      - python
+      - -B
+      - /app/codex_model_sync.py
+      - --base-url
+      - http://new-api:3000/v1
+      - --api-key-file
+      - /config/api-key
+      - --template
+      - /config/template.json
+      - --output
+      - /catalog/models.json
+      - --interval
+      - "3600"
+    volumes:
+      - ./bin/codex_model_sync.py:/app/codex_model_sync.py:ro
+      - ./.codex-sync/config:/config:ro
+      - ./.codex-sync/catalog:/catalog
+    depends_on:
+      new-api:
+        condition: service_healthy
+    networks:
+      - new-api-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,time; assert time.time()-os.stat('/catalog/models.last-success').st_mtime < 3720"]
+      interval: 30s
+      timeout: 5s
       retries: 3
 
   redis:

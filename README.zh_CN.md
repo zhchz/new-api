@@ -208,6 +208,30 @@ docker compose up -d
 docker compose logs -f new-api
 ```
 
+### 本机 Codex 模型菜单同步
+
+可选的 `codex-model-sync` Compose 服务在启动时同步一次，之后每小时调用网关的 `/v1/models`，将当前网关 Key 可见的模型同步为 Codex 本地模型目录。仅当目录内容发生变化时才写入，未变化时保留文件内容和修改时间。显式声明不支持 Responses 的模型不会出现在目录中；模型删除也会同步。请求失败时保留上次成功的目录，不会写入 API Key。
+
+启用前创建 `.codex-sync/config` 和 `.codex-sync/catalog`，将网关 Key 保存到 `.codex-sync/config/api-key`（权限 `600`），将现有 Codex 模型目录复制为 `.codex-sync/config/template.json`；没有目录时使用 `{"models":[]}`。模板按模型 ID 保留上下文、推理能力等元数据，未知模型使用保守默认值，不推断其能力。上述本地文件均不进入版本控制。
+
+在项目根目录 `.env` 中设置 `COMPOSE_PROFILES=codex`，并按 `id -u` / `id -g` 的输出设置 `CODEX_SYNC_UID` 和 `CODEX_SYNC_GID`（默认均为 `1000`），确保同步服务能读取配置目录并写入目录文件：
+
+```bash
+docker compose up -d
+docker compose logs --tail 20 codex-model-sync
+```
+
+首次同步成功后，将 `~/.codex/config.toml` 顶层的 `model_catalog_json` 设置为本项目 `.codex-sync/catalog/models.json` 的绝对路径。Codex 的 provider 应使用同一个网关和 Key。目录更新自动进行，但 Codex 只在启动时加载该配置，已有进程需要重启才能刷新 `/model` 菜单。该同步仅提供模型发现，调用是否成功仍取决于上游的 Responses 和工具调用支持。
+
+也可在宿主机执行一次同步：
+
+```bash
+python3 bin/codex_model_sync.py --once \
+  --api-key-file .codex-sync/config/api-key \
+  --template .codex-sync/config/template.json \
+  --output .codex-sync/catalog/models.json
+```
+
 ### 存储与配置
 
 | 组件 | 可选方案 |
