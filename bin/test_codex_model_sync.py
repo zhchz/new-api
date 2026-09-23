@@ -1,7 +1,9 @@
 import copy
 import http.server
 import json
+import os
 from pathlib import Path
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -91,6 +93,16 @@ class ModelSyncTests(unittest.TestCase):
         known["custom"]["value"] = 2
         self.assertEqual(template, original)
 
+    def test_step_5_preview_exposes_supported_reasoning_levels(self):
+        catalog = build_catalog(["step-5-preview", "unknown"], {"models": []})
+        step, unknown = catalog["models"]
+        self.assertEqual(step["default_reasoning_level"], "medium")
+        self.assertEqual(
+            [level["effort"] for level in step["supported_reasoning_levels"]],
+            ["low", "medium", "high"],
+        )
+        self.assertEqual(unknown["supported_reasoning_levels"], [])
+
     def test_failure_preserves_catalog_and_success_timestamp(self):
         sync_once(self.base_url, self.key, self.output)
         original = self.output.read_bytes()
@@ -135,6 +147,115 @@ class ModelSyncTests(unittest.TestCase):
                 sync_once(self.base_url, self.key, self.output)
         self.assertEqual(self.output.read_bytes(), original)
         self.assertEqual(list(self.output.parent.glob(".models-*")), [])
+
+
+class ManualSyncCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.calls = self.root / "calls"
+        self.environment = {
+            **os.environ,
+            "PATH": str(self.root) + os.pathsep + os.environ["PATH"],
+            "MOCK_CALLS": str(self.calls),
+            "MOCK_DAEMON_STATUS": '{"backend":"pid"}',
+        }
+        commands = {
+            "docker": '#!/bin/sh\nprintf "docker %s\\n" "$*" >> "$MOCK_CALLS"\nexit "${MOCK_DOCKER_STATUS:-0}"\n',
+            "codex": '#!/bin/sh\nprintf "codex %s\\n" "$*" >> "$MOCK_CALLS"\nif [ "$*" = "app-server daemon restart --help" ]; then exit 0; fi\nif [ "$*" = "app-server daemon version" ]; then printf "%s\\n" "$MOCK_DAEMON_STATUS"; exit 0; fi\nexit "${MOCK_CODEX_STATUS:-0}"\n',
+        }
+        for name, content in commands.items():
+            executable = self.root / name
+            executable.write_text(content)
+            executable.chmod(0o700)
+
+    def run_sync(self, *arguments):
+        script = Path(__file__).resolve().with_name("sync-codex-models.sh")
+        return subprocess.run(
+            ["bash", str(script), *arguments], cwd=self.root,
+            env=self.environment, text=True, capture_output=True, timeout=10,
+        )
+
+    def test_plain_sync_does_not_restart_codex(self):
+        result = self.run_sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls.read_text().splitlines()
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].startswith("docker compose run --rm --no-deps -T codex-model-sync "))
+        self.assertIn(" --once ", calls[0])
+
+    def test_explicit_restart_runs_after_successful_sync(self):
+        result = self.run_sync("--restart-codex")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls.read_text().splitlines()
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(calls[0], "codex app-server daemon restart --help")
+        self.assertTrue(calls[1].startswith("docker compose run "))
+        self.assertEqual(calls[2], "codex app-server daemon version")
+        self.assertEqual(calls[3], "codex app-server daemon restart")
+
+    def test_unmanaged_server_is_not_restarted(self):
+        self.environment["MOCK_DAEMON_STATUS"] = '{"status":"running","backend":null}'
+        result = self.run_sync("--restart-codex")
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("unmanaged app-server", result.stderr)
+        calls = self.calls.read_text().splitlines()
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[-1], "codex app-server daemon version")
+
+    def test_home_restart_syncs_before_restart(self):
+        sync_script = self.root / "sync"
+        sync_script.write_text('#!/bin/sh\nprintf "sync\\n" >> "$MOCK_CALLS"\nexit "${MOCK_SYNC_STATUS:-0}"\n')
+        sync_script.chmod(0o700)
+        self.environment["CODEX_MODEL_SYNC_SCRIPT"] = str(sync_script)
+        self.environment["NEW_API_KEY"] = "test-gateway-token"
+        codex_home = self.root / "codex-home"
+        codex_home.mkdir()
+        catalog = self.root / "catalog.json"
+        catalog.write_text('{"models": []}')
+        (codex_home / "config.toml").write_text('model_catalog_json = ' + json.dumps(str(catalog)))
+        self.environment["CODEX_HOME"] = str(codex_home)
+        script = Path(__file__).resolve().with_name("restart-codex-app-server.sh")
+        result = subprocess.run(
+            ["bash", str(script)], cwd=self.root, env=self.environment,
+            text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls.read_text().splitlines(), [
+            "sync", "codex app-server daemon version", "codex app-server daemon restart",
+        ])
+
+    def test_home_restart_stops_before_disrupting_sessions_if_sync_fails(self):
+        sync_script = self.root / "sync"
+        sync_script.write_text('#!/bin/sh\nprintf "sync\\n" >> "$MOCK_CALLS"\nexit 17\n')
+        sync_script.chmod(0o700)
+        self.environment["CODEX_MODEL_SYNC_SCRIPT"] = str(sync_script)
+        script = Path(__file__).resolve().with_name("restart-codex-app-server.sh")
+        result = subprocess.run(
+            ["bash", str(script)], cwd=self.root, env=self.environment,
+            text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 17)
+        self.assertEqual(self.calls.read_text().splitlines(), ["sync"])
+
+    def test_failed_sync_does_not_restart_codex(self):
+        self.environment["MOCK_DOCKER_STATUS"] = "17"
+        result = self.run_sync("--restart-codex")
+        self.assertEqual(result.returncode, 17)
+        calls = self.calls.read_text().splitlines()
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("codex app-server daemon restart", calls)
+
+    def test_restart_failure_is_reported(self):
+        self.environment["MOCK_CODEX_STATUS"] = "18"
+        result = self.run_sync("--restart-codex")
+        self.assertEqual(result.returncode, 18)
+
+    def test_help_and_invalid_option_do_not_sync_or_restart(self):
+        self.assertEqual(self.run_sync("--help").returncode, 0)
+        self.assertEqual(self.run_sync("--invalid").returncode, 2)
+        self.assertFalse(self.calls.exists())
 
 
 if __name__ == "__main__":

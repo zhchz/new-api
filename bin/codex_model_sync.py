@@ -93,6 +93,13 @@ def build_catalog(names, template):
                 "truncation_policy": {"mode": "tokens", "limit": 10000},
                 "experimental_supported_tools": [],
             }
+            if name == "step-5-preview":
+                profile["default_reasoning_level"] = "medium"
+                profile["supported_reasoning_levels"] = [
+                    {"effort": "low", "description": "Faster responses with lighter reasoning"},
+                    {"effort": "medium", "description": "Balanced reasoning for everyday tasks"},
+                    {"effort": "high", "description": "Deeper reasoning for complex tasks"},
+                ]
         profile.update(visibility="list", supported_in_api=True, priority=priority)
         models.append(profile)
     return {"models": models}

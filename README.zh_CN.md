@@ -212,6 +212,8 @@ docker compose logs -f new-api
 
 可选的 `codex-model-sync` Compose 服务在启动时同步一次，之后每小时调用网关的 `/v1/models`，将当前网关 Key 可见的模型同步为 Codex 本地模型目录。仅当目录内容发生变化时才写入，未变化时保留文件内容和修改时间。显式声明不支持 Responses 的模型不会出现在目录中；模型删除也会同步。请求失败时保留上次成功的目录，不会写入 API Key。
 
+`step-5-preview` 的目录元数据提供 `low`、`medium`、`high` 三档思考强度，默认为 `medium`；其他未知模型仍不推断其推理能力。
+
 启用前创建 `.codex-sync/config` 和 `.codex-sync/catalog`，将网关 Key 保存到 `.codex-sync/config/api-key`（权限 `600`），将现有 Codex 模型目录复制为 `.codex-sync/config/template.json`；没有目录时使用 `{"models":[]}`。模板按模型 ID 保留上下文、推理能力等元数据，未知模型使用保守默认值，不推断其能力。上述本地文件均不进入版本控制。
 
 在项目根目录 `.env` 中设置 `COMPOSE_PROFILES=codex`，并按 `id -u` / `id -g` 的输出设置 `CODEX_SYNC_UID` 和 `CODEX_SYNC_GID`（默认均为 `1000`），确保同步服务能读取配置目录并写入目录文件：
@@ -223,14 +225,23 @@ docker compose logs --tail 20 codex-model-sync
 
 首次同步成功后，将 `~/.codex/config.toml` 顶层的 `model_catalog_json` 设置为本项目 `.codex-sync/catalog/models.json` 的绝对路径。Codex 的 provider 应使用同一个网关和 Key。目录更新自动进行，但 Codex 只在启动时加载该配置，已有进程需要重启才能刷新 `/model` 菜单。该同步仅提供模型发现，调用是否成功仍取决于上游的 Responses 和工具调用支持。
 
-也可在宿主机执行一次同步：
+需要立即同步时，在项目根目录执行：
 
 ```bash
-python3 bin/codex_model_sync.py --once \
-  --api-key-file .codex-sync/config/api-key \
-  --template .codex-sync/config/template.json \
-  --output .codex-sync/catalog/models.json
+./bin/sync-codex-models.sh
 ```
+
+该命令启动临时容器执行一次同步，完成后自动删除容器，不改变每小时自动查询的计划。网关必须已启动，并已准备上述配置文件。也可从任意目录通过脚本的绝对路径调用；失败时返回非零退出码，未变化时不重写模型目录。同步完成后重新启动 Codex，即可加载更新后的菜单。
+
+使用 SSH 连接持久化 Codex app-server daemon 时，重连 SSH 可能只重新连接代理，后台进程仍保留旧目录。在服务器的普通 SSH 终端中执行以下命令，可同步并尝试重启当前用户的受管 daemon：
+
+```bash
+./bin/sync-codex-models.sh --restart-codex
+```
+
+该选项仅在同步成功且 `codex app-server daemon version` 报告 `backend` 为 `pid` 时重启。重启会中断该 daemon 上正在执行的任务；命令完成后重新连接客户端。独立运行的 Codex CLI 或 IDE 进程仍需退出后重新打开。请使用运行 Codex 的同一用户和 `CODEX_HOME`，避免操作其他配置目录。
+
+如果脚本报告 `unmanaged app-server`，说明该服务由 Codex SSH 客户端的代理进程启动，`codex app-server daemon restart` 和 `bootstrap` 都不能接管。先退出连接该服务器的 Codex 客户端，在另一个普通 SSH 终端中用 `ps -u "$USER" -o pid,args | grep '[c]odex app-server --listen'` 找到当前用户的 app-server 进程，确认命令和 PID 后执行 `kill <PID>`，再重新连接客户端。关闭客户端可防止代理立即重新启动旧服务；不要用 `pkill codex`，它会影响同一用户的其他会话。完成后在新进程中检查模型菜单。
 
 ### 存储与配置
 
