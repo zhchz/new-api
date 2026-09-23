@@ -164,7 +164,7 @@ def sync_once(base_url, api_key_file, output, template_file=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Sync New API models to a Codex model catalog")
-    parser.add_argument("--base-url", default="http://127.0.0.1:9000/v1")
+    parser.add_argument("--base-url", required=True)
     parser.add_argument("--api-key-file", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--template", help="Existing Codex catalog supplying per-model metadata")

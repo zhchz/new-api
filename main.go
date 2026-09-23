@@ -51,6 +51,17 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "plugin" {
 		os.Exit(jsplugin.RunCLI(os.Args[2:], os.Stdout, os.Stderr))
 	}
+	if len(os.Args) == 2 && os.Args[1] == "--print-listen-port" {
+		_ = godotenv.Load(".env")
+		port := gatewayListeningPort()
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			fmt.Fprintln(os.Stderr, "invalid gateway listening port")
+			os.Exit(1)
+		}
+		fmt.Println(port)
+		return
+	}
 	startTime := time.Now()
 	kitutil.SetLogging(common.SysLog, func(message string) {
 		logger.LogError(nil, message)
@@ -206,10 +217,7 @@ func main() {
 		BuildFS:   buildFS,
 		IndexPage: indexPage,
 	})
-	var port = os.Getenv("PORT")
-	if port == "" {
-		port = strconv.Itoa(*common.Port)
-	}
+	port := gatewayListeningPort()
 
 	srv := &http.Server{
 		Addr:    ":" + port,
@@ -287,6 +295,13 @@ func InjectGoogleAnalytics() {
 	analyticsInject := []byte(analyticsInjectBuilder.String())
 	placeholder := []byte("<!--Google Analytics-->\n")
 	indexPage = bytes.ReplaceAll(indexPage, placeholder, analyticsInject)
+}
+
+func gatewayListeningPort() string {
+	if port := os.Getenv("PORT"); port != "" {
+		return port
+	}
+	return strconv.Itoa(*common.Port)
 }
 
 func InitResources() error {

@@ -210,9 +210,9 @@ docker compose logs -f new-api
 
 ### Codex 模型菜单自动同步
 
-管理员只需为当前部署手工创建 `.codex-sync/config/api-key`，内容为一行有权访问模型的 New API Token。不要在命令行参数、`config.toml` 或版本库中写入密钥。部署入口会生成目录、`template.json`、模型清单，并配置当前用户的 `$CODEX_HOME/config.toml`（未设置时为 `~/.codex/config.toml`）。首次改动配置时会保留 `config.toml.codex-sync-backup`。已有模型目录存在时，首次初始化会复制其模型元数据作为模板；否则自动生成空模板。后续运行不会覆盖模板或密钥。模型目录仅在内容变化时重写；请求失败保留上次成功的目录。
+模型同步所用的 `.codex-sync/config/api-key` 最终需要保存一行有权访问模型的 New API Token；Linux Docker 部署前手工创建，Windows exe 首次部署后在控制台生成并替换占位符。不要在命令行参数、`config.toml` 或版本库中写入密钥。部署入口会生成目录、`template.json`、模型清单，并配置当前用户的 `$CODEX_HOME/config.toml`（未设置时为 `~/.codex/config.toml`）。首次改动配置时会保留 `config.toml.codex-sync-backup`。已有模型目录存在时，首次初始化会复制其模型元数据作为模板；否则自动生成空模板。后续运行不会覆盖模板或密钥。模型目录仅在内容变化时重写；请求失败保留上次成功的目录。
 
-**Linux Docker**：先在项目根目录创建唯一需要手工维护的密钥文件，然后运行部署入口。请先按上文配置好 Compose 的数据库、Redis 和 `SESSION_SECRET` 等必需设置。默认 Codex 网关地址为本机 `http://127.0.0.1:9000/v1`；端口或反向代理不同可设置 `NEW_API_CODEX_BASE_URL`。脚本使用当前仓库工作树执行 `docker build --pull`，Go 默认走 `https://goproxy.cn`（可通过 `GOPROXY` 环境变量更换），成功后强制替换 `new-api` 容器；等新容器健康，再重建同步服务并完成首次同步。重建时使用 `--no-deps`，不会重建数据库和 Redis 容器。它不会自动执行 `git pull` 或清理旧镜像；需要远端最新代码时先同步 Git。脚本按当前 UID/GID 启动同步容器。如果当前用户只能通过 `sudo docker` 访问 Docker，将命令写为 `DOCKER_WITH_SUDO=1 ./bin/deploy-codex-sync.sh`；不要直接以 root 用户运行整个脚本，以免写入 root 的 Codex 配置。需要换 Go 代理时，例如运行 `GOPROXY=https://proxy.golang.com.cn,direct ./bin/deploy-codex-sync.sh`。
+**Linux Docker**：先在项目根目录创建唯一需要手工维护的密钥文件，然后运行部署入口。请先按上文配置好 Compose 的数据库、Redis 和 `SESSION_SECRET` 等必需设置。Codex 网关地址默认使用 Compose 解析后的 `new-api` 宿主机 TCP 映射端口（本机 `127.0.0.1`）；使用反向代理或多个端口映射时可设置 `NEW_API_CODEX_BASE_URL`。脚本使用当前仓库工作树执行 `docker build --pull`，Go 默认走 `https://goproxy.cn`（可通过 `GOPROXY` 环境变量更换），成功后强制替换 `new-api` 容器；等新容器健康，再重建同步服务并完成首次同步。重建时使用 `--no-deps`，不会重建数据库和 Redis 容器。它不会自动执行 `git pull` 或清理旧镜像；需要远端最新代码时先同步 Git。脚本按当前 UID/GID 启动同步容器。如果当前用户只能通过 `sudo docker` 访问 Docker，将命令写为 `DOCKER_WITH_SUDO=1 ./bin/deploy-codex-sync.sh`；不要直接以 root 用户运行整个脚本，以免写入 root 的 Codex 配置。需要换 Go 代理时，例如运行 `GOPROXY=https://proxy.golang.com.cn,direct ./bin/deploy-codex-sync.sh`。
 
 ```bash
 mkdir -p -m 700 .codex-sync/config
@@ -221,13 +221,16 @@ chmod 600 .codex-sync/config/api-key
 ./bin/deploy-codex-sync.sh
 ```
 
-**Windows exe**：安装 Go 1.25.1 与 Bun，在 PowerShell 中从仓库根目录执行。先用编辑器手工创建 `.codex-sync\config\api-key`，内容同上。脚本自动构建前端和 `newapi.exe`，写入 Codex 配置，启动网关，并等待首次模型目录同步。默认监听 9900；已有该目录的 `newapi.exe` 正在运行时先停止它，再执行部署命令。
+**Windows exe**：安装 Go 1.25.1 与 Bun，在 PowerShell 中从仓库根目录执行部署命令。首次运行无需 API Key：脚本会自动创建 `.codex-sync\config\api-key` 并填入 `REPLACE_WITH_NEW_API_KEY` 占位符，构建前端与 `newapi.exe`、配置 Codex 并启动网关；此时不会等待模型同步成功。默认从编译后的 exe 读取监听端口（含 `PORT` 环境变量或 `.env`）；传入 `-Port` 时将同时设置网关监听端口和 Codex 地址。已有该目录的 `newapi.exe` 正在运行时先停止它，再执行部署命令。已有的真实密钥和模型目录不会被覆盖。
 
 ```powershell
-New-Item -ItemType Directory -Force .codex-sync\config | Out-Null
-# 用编辑器将 New API Token 写入 .codex-sync\config\api-key，内容只有一行
 powershell -ExecutionPolicy Bypass -File .\bin\deploy-codex-sync.ps1
+# 网关启动后，在管理控制台创建有权访问模型的 API Key，再编辑下列文件
+notepad .codex-sync\config\api-key
+# 将占位符替换为单行真实密钥并保存（不要提交到版本库）
 ```
+
+Windows 网关发现密钥已替换后约 10 秒内重试模型同步；确认 `.codex-sync\catalog\models.last-success` 的更新时间晚于粘贴密钥、模型目录已更新，再启动 Codex。密钥文件仍是占位符时，Codex 启动脚本会拒绝运行。
 
 Windows 可用 `-Port 9901` 改端口；只编译和配置、不启动时传入 `-NoStart`。Windows Codex 需要通过 `powershell -ExecutionPolicy Bypass -File .\bin\start-codex-with-new-api-key.ps1` 启动，脚本在进程内从 `api-key` 导入 `NEW_API_KEY`，无需额外创建 `.codex/newapi.env`。Linux SSH Codex 的重启脚本也会导入同一文件；普通 Linux CLI 可用 `./bin/start-codex-with-new-api-key.sh` 启动。生成的 Codex provider 使用 `env_key = "NEW_API_KEY"` 与 Responses 协议；目录仅提供模型发现，实际调用仍取决于上游的 Responses 和工具支持。
 

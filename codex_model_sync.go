@@ -20,6 +20,10 @@ import (
 
 const codexCatalogResponseLimit = 8 << 20
 
+const codexGatewayKeyPlaceholder = "REPLACE_WITH_NEW_API_KEY"
+
+var errCodexGatewayKeyPending = errors.New("gateway API key has not been configured")
+
 // Windows uses the gateway executable as the only service entry point.
 // Linux keeps using the optional codex-model-sync Compose service.
 func startWindowsCodexModelSync(port string) {
@@ -52,6 +56,10 @@ func startWindowsCodexModelSync(port string) {
 	go func() {
 		for {
 			count, changed, err := syncCodexModelCatalog(context.Background(), client, baseURL, keyPath, templatePath, outputPath)
+			if errors.Is(err, errCodexGatewayKeyPending) {
+				time.Sleep(10 * time.Second)
+				continue
+			}
 			if err != nil {
 				common.SysLog("Codex model sync failed: " + err.Error() + "; previous catalog retained")
 				time.Sleep(5 * time.Minute)
@@ -74,7 +82,10 @@ func syncCodexModelCatalog(ctx context.Context, client *http.Client, baseURL, ke
 		return 0, false, errors.New("gateway key file too large")
 	}
 	apiKey := strings.TrimSpace(strings.TrimPrefix(string(keyFile), "\ufeff"))
-	if apiKey == "" || strings.ContainsAny(apiKey, "\r\n") {
+	if apiKey == "" || apiKey == codexGatewayKeyPlaceholder {
+		return 0, false, errCodexGatewayKeyPending
+	}
+	if strings.ContainsAny(apiKey, "\r\n") {
 		return 0, false, errors.New("NEW_API_KEY is missing or invalid")
 	}
 

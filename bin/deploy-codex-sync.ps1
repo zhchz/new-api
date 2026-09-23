@@ -1,5 +1,5 @@
 param(
-    [int]$Port = 9900,
+    [int]$Port,
     [switch]$NoStart
 )
 $ErrorActionPreference = 'Stop'
@@ -10,14 +10,49 @@ if (Get-Process -Name newapi -ErrorAction SilentlyContinue | Where-Object { $_.P
 }
 New-Item -ItemType Directory -Force (Join-Path $root '.codex-sync\config') | Out-Null
 $keyPath = Join-Path $root '.codex-sync\config\api-key'
-if (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) {
-    throw "Create the gateway key file first: $keyPath"
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+$placeholder = 'REPLACE_WITH_NEW_API_KEY'
+if (-not (Test-Path -LiteralPath $keyPath)) {
+    [IO.File]::WriteAllText($keyPath, $placeholder + "`n", $utf8)
+} elseif (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) {
+    throw "Gateway key path is not a file: $keyPath"
 }
 $key = [IO.File]::ReadAllText($keyPath).Trim()
-if (-not $key -or $key.Contains("`n") -or $key.Contains("`r")) {
-    throw 'Gateway key must contain one nonempty line'
+if (-not $key) {
+    [IO.File]::WriteAllText($keyPath, $placeholder + "`n", $utf8)
+    $key = $placeholder
 }
-if ($Port -lt 1 -or $Port -gt 65535) { throw 'Invalid port' }
+if ($key.Contains("`n") -or $key.Contains("`r")) {
+    throw 'Gateway key must contain one line'
+}
+$keyPending = $key -eq $placeholder
+if ($PSBoundParameters.ContainsKey('Port')) {
+    if ($Port -lt 1 -or $Port -gt 65535) { throw 'Invalid port' }
+    $env:PORT = "$Port"
+}
+if (-not (Get-Command bun -ErrorAction SilentlyContinue)) { throw 'Install Bun before building the frontend' }
+if (-not (Get-Command go -ErrorAction SilentlyContinue)) { throw 'Install Go before building the exe' }
+Push-Location (Join-Path $root 'web')
+try {
+    bun install --frozen-lockfile
+    if ($LASTEXITCODE -ne 0) { throw 'bun install failed' }
+    bun run build
+    if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed' }
+} finally { Pop-Location }
+Push-Location $root
+try {
+    go build -o newapi.exe .
+    if ($LASTEXITCODE -ne 0) { throw 'Go build failed' }
+} finally { Pop-Location }
+if (-not $PSBoundParameters.ContainsKey('Port')) {
+    Push-Location $root
+    try {
+        $portText = (& $exePath --print-listen-port)
+        if ($LASTEXITCODE -ne 0 -or -not [int]::TryParse($portText, [ref]$Port) -or $Port -lt 1 -or $Port -gt 65535) {
+            throw 'Could not determine the gateway listening port from newapi.exe'
+        }
+    } finally { Pop-Location }
+}
 $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
 $configPath = Join-Path $codexHome 'config.toml'
 $original = if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllText($configPath) } else { '' }
@@ -37,7 +72,6 @@ $templatePath = Join-Path $root '.codex-sync\config\template.json'
 $catalogPath = Join-Path $root '.codex-sync\catalog\models.json'
 New-Item -ItemType Directory -Force (Split-Path $templatePath) | Out-Null
 New-Item -ItemType Directory -Force (Split-Path $catalogPath) | Out-Null
-$utf8 = New-Object System.Text.UTF8Encoding($false)
 if (-not (Test-Path -LiteralPath $templatePath)) {
     $existingCatalog = $null
     if ($original -match '(?m)^model_catalog_json\s*=\s*"([^"\r\n]+)"') {
@@ -53,6 +87,9 @@ if (-not (Test-Path -LiteralPath $templatePath)) {
 } else {
     $value = [IO.File]::ReadAllText($templatePath) | ConvertFrom-Json
     if ($value.models -isnot [array]) { throw 'Invalid existing model template' }
+}
+if (-not (Test-Path -LiteralPath $catalogPath)) {
+    [IO.File]::WriteAllText($catalogPath, "{`"models`":[]}`n", $utf8)
 }
 foreach ($pair in @(@($start, $end), @($providerStart, $providerEnd))) {
     $pattern = '(?s)(?m)^' + [regex]::Escape($pair[0]) + '\r?\n.*?^' + [regex]::Escape($pair[1]) + '\r?\n?'
@@ -101,34 +138,31 @@ if ($updated -ne $(if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllT
         if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary }
     }
 }
-if (-not (Get-Command bun -ErrorAction SilentlyContinue)) { throw 'Install Bun before building the frontend' }
-if (-not (Get-Command go -ErrorAction SilentlyContinue)) { throw 'Install Go before building the exe' }
-Push-Location (Join-Path $root 'web')
-try {
-    bun install --frozen-lockfile
-    if ($LASTEXITCODE -ne 0) { throw 'bun install failed' }
-    bun run build
-    if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed' }
-} finally { Pop-Location }
-Push-Location $root
-try {
-    go build -o newapi.exe .
-    if ($LASTEXITCODE -ne 0) { throw 'Go build failed' }
-} finally { Pop-Location }
 if (-not $NoStart) {
-    $env:PORT = "$Port"
     $startedAt = Get-Date
-    Start-Process -FilePath (Join-Path $root 'newapi.exe') -WorkingDirectory $root
-    $markerPath = Join-Path $root '.codex-sync\catalog\models.last-success'
-    $deadline = (Get-Date).AddSeconds(90)
-    while ((Get-Date) -lt $deadline -and
-        (-not (Test-Path -LiteralPath $markerPath) -or (Get-Item -LiteralPath $markerPath).LastWriteTime -lt $startedAt)) {
+    $process = Start-Process -FilePath $exePath -WorkingDirectory $root -WindowStyle Hidden -PassThru
+    if ($keyPending) {
         Start-Sleep -Seconds 2
-    }
-    if (-not (Test-Path -LiteralPath $catalogPath) -or -not (Test-Path -LiteralPath $markerPath) -or
-        (Get-Item -LiteralPath $markerPath).LastWriteTime -lt $startedAt) {
-        throw 'Gateway started, but model catalog was not generated within 90 seconds'
+        if ($process.HasExited) { throw 'Gateway exited after launch; check its startup configuration and logs' }
+    } else {
+        $markerPath = Join-Path $root '.codex-sync\catalog\models.last-success'
+        $deadline = (Get-Date).AddSeconds(90)
+        while ((Get-Date) -lt $deadline -and
+            (-not (Test-Path -LiteralPath $markerPath) -or (Get-Item -LiteralPath $markerPath).LastWriteTime -lt $startedAt)) {
+            if ($process.HasExited) { throw 'Gateway exited before model catalog sync; check its startup configuration and logs' }
+            Start-Sleep -Seconds 2
+        }
+        if (-not (Test-Path -LiteralPath $markerPath) -or
+            (Get-Item -LiteralPath $markerPath).LastWriteTime -lt $startedAt) {
+            throw 'Gateway started, but model catalog was not generated within 90 seconds'
+        }
     }
 }
+Write-Host "Gateway address: http://127.0.0.1:$Port"
 Write-Host "Catalog: $catalogPath"
-Write-Host 'Restart Codex through bin\start-codex-with-new-api-key.ps1 to load its key and model menu.'
+if ($keyPending) {
+    Write-Host "After the gateway is running, create an API key in its console and replace the placeholder in $keyPath. The catalog sync will retry automatically."
+    Write-Host 'After the catalog sync succeeds, start Codex through bin\start-codex-with-new-api-key.ps1.'
+} else {
+    Write-Host 'Restart Codex through bin\start-codex-with-new-api-key.ps1 to load its key and model menu.'
+}

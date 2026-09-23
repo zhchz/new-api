@@ -372,6 +372,7 @@ class CodexConfigurationTests(unittest.TestCase):
             self.assertEqual(config.read_text(), 'model = "existing"\n')
 
 
+@unittest.skipUnless(os.name == "posix", "Docker deployment uses POSIX shell paths")
 class DockerDeploymentTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -393,7 +394,7 @@ class DockerDeploymentTests(unittest.TestCase):
         docker.write_text(
             '#!/bin/sh\nprintf "%s\\n" "$*" >> "$MOCK_CALLS"\n'
             'case "$*" in\n'
-            '  "compose config --format json") printf \'{"services":{"new-api":{"image":"new-api:test"}}}\\n\' ;;\n'
+            '  "compose config --format json") if [ -n "$MOCK_COMPOSE_JSON" ]; then printf "%s\\n" "$MOCK_COMPOSE_JSON"; else printf \'{"services":{"new-api":{"image":"new-api:test","ports":[{"published":"9876","target":3000,"protocol":"tcp"}]}}}\\n\'; fi ;;\n'
             '  "compose ps -q new-api") printf "container-id\\n" ;;\n'
             '  inspect*) printf "healthy\\n" ;;\n'
             '  build*) exit "${MOCK_BUILD_STATUS:-0}" ;;\n'
@@ -406,6 +407,8 @@ class DockerDeploymentTests(unittest.TestCase):
             "CODEX_HOME": str(self.root / "codex-home"),
             "MOCK_CALLS": str(self.calls),
         }
+        self.environment.pop("NEW_API_CODEX_BASE_URL", None)
+        self.environment.pop("MOCK_COMPOSE_JSON", None)
 
     def test_deploy_builds_before_replacing_gateway_without_touching_dependencies(self):
         result = subprocess.run(
@@ -414,6 +417,8 @@ class DockerDeploymentTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text().splitlines()
+        self.assertIn('base_url = "http://127.0.0.1:9876/v1"',
+                      (self.root / "codex-home/config.toml").read_text())
         self.assertEqual(calls[:5], [
             "compose config --format json",
             "build --pull -t new-api:test .",
@@ -435,6 +440,85 @@ class DockerDeploymentTests(unittest.TestCase):
             "compose config --format json",
             "build --pull -t new-api:test .",
         ])
+
+    def test_explicit_codex_url_allows_compose_without_published_port(self):
+        self.environment["MOCK_COMPOSE_JSON"] = json.dumps({
+            "services": {"new-api": {"image": "new-api:test", "ports": []}}
+        })
+        self.environment["NEW_API_CODEX_BASE_URL"] = "https://proxy.example/v1"
+        result = subprocess.run(
+            ["bash", str(self.root / "bin/deploy-codex-sync.sh")],
+            env=self.environment, text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('base_url = "https://proxy.example/v1"',
+                      (self.root / "codex-home/config.toml").read_text())
+
+    def test_missing_published_port_fails_before_build(self):
+        self.environment["MOCK_COMPOSE_JSON"] = json.dumps({
+            "services": {"new-api": {"image": "new-api:test", "ports": []}}
+        })
+        result = subprocess.run(
+            ["bash", str(self.root / "bin/deploy-codex-sync.sh")],
+            env=self.environment, text=True, capture_output=True, timeout=10,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("one fixed published TCP port", result.stderr)
+        self.assertEqual(self.calls.read_text().splitlines(), ["compose config --format json"])
+
+
+@unittest.skipUnless(os.name == "nt", "Windows PowerShell deployment")
+class WindowsExeDeploymentTests(unittest.TestCase):
+    def test_first_deploy_bootstraps_placeholder_without_requiring_a_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "bin").mkdir()
+            (root / "web").mkdir()
+            script = root / "bin/deploy-codex-sync.ps1"
+            script.write_bytes(Path(__file__).resolve().with_name(script.name).read_bytes())
+            codex_home = root / "codex-home"
+            environment = {**os.environ, "CODEX_HOME": str(codex_home)}
+            command = (
+                "function bun { $global:LASTEXITCODE = 0 }; "
+                "function go { $global:LASTEXITCODE = 0 }; "
+                f"& '{str(script).replace(chr(39), chr(39) * 2)}' -NoStart -Port 9901"
+            )
+            args = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-Command", command]
+            first = subprocess.run(args, env=environment, text=True,
+                                   capture_output=True, timeout=20)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            key = root / ".codex-sync/config/api-key"
+            self.assertEqual(key.read_text().strip(), "REPLACE_WITH_NEW_API_KEY")
+            self.assertEqual(json.loads((root / ".codex-sync/catalog/models.json").read_text()),
+                             {"models": []})
+            self.assertFalse((root / ".codex-sync/catalog/models.last-success").exists())
+            self.assertIn('env_key = "NEW_API_KEY"',
+                          (codex_home / "config.toml").read_text())
+            self.assertIn('base_url = "http://127.0.0.1:9901/v1"',
+                          (codex_home / "config.toml").read_text())
+
+            key.write_text("test-gateway-token\n")
+            second = subprocess.run(args, env=environment, text=True,
+                                    capture_output=True, timeout=20)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(key.read_text(), "test-gateway-token\n")
+            self.assertFalse((root / ".codex-sync/catalog/models.last-success").exists())
+
+            key.write_text("")
+            third = subprocess.run(args, env=environment, text=True,
+                                   capture_output=True, timeout=20)
+            self.assertEqual(third.returncode, 0, third.stderr)
+            self.assertEqual(key.read_text().strip(), "REPLACE_WITH_NEW_API_KEY")
+            launcher = root / "bin/start-codex-with-new-api-key.ps1"
+            launcher.write_bytes(Path(__file__).resolve().with_name(launcher.name).read_bytes())
+            rejected = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", str(launcher)],
+                env=environment, text=True, capture_output=True, timeout=20,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("Invalid gateway key", rejected.stderr)
 
 
 if __name__ == "__main__":
