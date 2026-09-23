@@ -32,7 +32,7 @@ if [[ -z "$image_ref" ]]; then
   exit 1
 fi
 
-"${docker_command[@]}" build --pull -t "$image_ref" .
+"${docker_command[@]}" build --pull --build-arg "GOPROXY=${GOPROXY:-https://goproxy.cn,direct}" -t "$image_ref" .
 "${docker_command[@]}" compose up -d --no-deps --force-recreate new-api
 
 container_id="$("${docker_command[@]}" compose ps -q new-api)"
