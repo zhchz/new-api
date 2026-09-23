@@ -11,6 +11,7 @@ from unittest.mock import patch
 import urllib.error
 
 from codex_model_sync import build_catalog, sync_once
+from configure_codex_sync import configure
 
 
 class ModelServer(http.server.BaseHTTPRequestHandler):
@@ -187,6 +188,7 @@ class ManualSyncCommandTests(unittest.TestCase):
             "PATH": str(self.root) + os.pathsep + os.environ["PATH"],
             "MOCK_CALLS": str(self.calls),
             "MOCK_DAEMON_STATUS": '{"backend":"pid"}',
+            "NEW_API_KEY": "test-gateway-token",
         }
         commands = {
             "docker": '#!/bin/sh\nprintf "docker %s\\n" "$*" >> "$MOCK_CALLS"\nexit "${MOCK_DOCKER_STATUS:-0}"\n',
@@ -211,6 +213,18 @@ class ManualSyncCommandTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertTrue(calls[0].startswith("docker compose run --rm --no-deps -T codex-model-sync "))
         self.assertIn(" --once ", calls[0])
+
+    def test_sudo_docker_keeps_current_user_for_catalog_files(self):
+        sudo = self.root / "sudo"
+        sudo.write_text('#!/bin/sh\nprintf "sudo %s\\n" "$*" >> "$MOCK_CALLS"\n')
+        sudo.chmod(0o700)
+        self.environment["DOCKER_WITH_SUDO"] = "1"
+        result = self.run_sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        call = self.calls.read_text().strip()
+        self.assertIn(f"CODEX_SYNC_UID={os.getuid()}", call)
+        self.assertIn(f"CODEX_SYNC_GID={os.getgid()}", call)
+        self.assertIn(" docker compose run ", call)
 
     def test_explicit_restart_runs_after_successful_sync(self):
         result = self.run_sync("--restart-codex")
@@ -283,6 +297,79 @@ class ManualSyncCommandTests(unittest.TestCase):
         self.assertEqual(self.run_sync("--help").returncode, 0)
         self.assertEqual(self.run_sync("--invalid").returncode, 2)
         self.assertFalse(self.calls.exists())
+
+    def test_linux_codex_launcher_reads_only_the_key_file(self):
+        key = self.root / ".codex-sync/config/api-key"
+        key.parent.mkdir(parents=True)
+        key.write_text("test-gateway-token\n")
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        launcher = bin_dir / "start-codex-with-new-api-key.sh"
+        launcher.write_bytes(Path(__file__).resolve().with_name(launcher.name).read_bytes())
+        codex = self.root / "codex"
+        codex.write_text('#!/bin/sh\nprintf "%s\\n" "$NEW_API_KEY"\n')
+        codex.chmod(0o700)
+        result = subprocess.run(["bash", str(launcher)], env=self.environment,
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "test-gateway-token")
+
+
+class CodexConfigurationTests(unittest.TestCase):
+    def test_fresh_install_generates_empty_template_and_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = root / ".codex-sync/config/api-key"
+            key.parent.mkdir(parents=True)
+            key.write_text("test-gateway-token\n")
+            codex_home = root / "home"
+            catalog = configure(root, codex_home, "http://127.0.0.1:9000/v1")
+            self.assertEqual(json.loads((root / ".codex-sync/config/template.json").read_text()),
+                             {"models": []})
+            self.assertEqual(catalog, root / ".codex-sync/catalog/models.json")
+            self.assertIn('model_provider = "new_api_sync"',
+                          (codex_home / "config.toml").read_text())
+
+    def test_initialization_preserves_metadata_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = root / ".codex-sync/config/api-key"
+            key.parent.mkdir(parents=True)
+            key.write_text("test-gateway-token\n")
+            codex_home = root / "home"
+            codex_home.mkdir()
+            previous_catalog = root / "previous.json"
+            previous_catalog.write_text('{"models":[{"slug":"known","context_window":12345}]}')
+            config = codex_home / "config.toml"
+            config.write_text(
+                'model_catalog_json = ' + json.dumps(str(previous_catalog)) + '\n'
+                'model_provider = "old"\n[features]\nfoo = true\n'
+            )
+            catalog = configure(root, codex_home, "http://127.0.0.1:9000/v1")
+            self.assertEqual(catalog, root / ".codex-sync/catalog/models.json")
+            template = root / ".codex-sync/config/template.json"
+            self.assertEqual(json.loads(template.read_text())["models"][0]["context_window"], 12345)
+            self.assertEqual((codex_home / "config.toml.codex-sync-backup").read_text(),
+                             'model_catalog_json = ' + json.dumps(str(previous_catalog)) + '\n'
+                             'model_provider = "old"\n[features]\nfoo = true\n')
+            first = config.read_text()
+            self.assertIn('env_key = "NEW_API_KEY"', first)
+            self.assertIn('foo = true', first)
+            self.assertNotIn("test-gateway-token", first)
+            self.assertEqual(configure(root, codex_home, "http://127.0.0.1:9000/v1"), catalog)
+            self.assertEqual(config.read_text(), first)
+            self.assertEqual(json.loads(template.read_text())["models"][0]["context_window"], 12345)
+
+    def test_missing_key_leaves_codex_configuration_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            codex_home = root / "home"
+            codex_home.mkdir()
+            config = codex_home / "config.toml"
+            config.write_text('model = "existing"\n')
+            with self.assertRaisesRegex(ValueError, "Create the gateway key"):
+                configure(root, codex_home, "http://127.0.0.1:9000/v1")
+            self.assertEqual(config.read_text(), 'model = "existing"\n')
 
 
 if __name__ == "__main__":

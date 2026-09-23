@@ -208,42 +208,37 @@ docker compose up -d
 docker compose logs -f new-api
 ```
 
-### 本机 Codex 模型菜单同步
+### Codex 模型菜单自动同步
 
-Windows 直接启动 `newapi.exe` 时，程序会从 exe 所在目录的 `.codex/newapi.env` 读取 `NEW_API_KEY=本机 New API Token`，启动后调用本机网关的 `/v1/models`，成功后每小时同步一次，失败时每 5 分钟重试。目录写入 exe 所在目录的 `.codex-sync/catalog/models.json`；不需要 Docker 或额外启动脚本。将 Codex 用户配置中的 `model_catalog_json` 指向这个文件，目录更新后手动重启 Codex 即可加载新模型。Windows 通道若需使用宿主机代理，应配置 `http://127.0.0.1:7890`。
+管理员只需为当前部署手工创建 `.codex-sync/config/api-key`，内容为一行有权访问模型的 New API Token。不要在命令行参数、`config.toml` 或版本库中写入密钥。部署入口会生成目录、`template.json`、模型清单，并配置当前用户的 `$CODEX_HOME/config.toml`（未设置时为 `~/.codex/config.toml`）。首次改动配置时会保留 `config.toml.codex-sync-backup`。已有模型目录存在时，首次初始化会复制其模型元数据作为模板；否则自动生成空模板。后续运行不会覆盖模板或密钥。模型目录仅在内容变化时重写；请求失败保留上次成功的目录。
 
-可选的 `codex-model-sync` Compose 服务在启动时同步一次，之后每小时调用网关的 `/v1/models`，将当前网关 Key 可见的模型同步为 Codex 本地模型目录。仅当目录内容发生变化时才写入，未变化时保留文件内容和修改时间。显式声明不支持 Responses 的模型不会出现在目录中；模型删除也会同步。请求失败时保留上次成功的目录，不会写入 API Key。
-
-已确认能力的 GPT 模型会在目录中提供各自支持的思考强度：`gpt-5.5` 提供 `none` 至 `xhigh`，`gpt-5.6` 与 `gpt-6-sol/luna` 提供 `none` 至 `max`，`gpt-6-astra` 提供 `low` 至 `max`。现有模板显式定义的档位仍会保留；其他未知模型不推断其推理能力。目录里的选项需要上游模型实际支持，更新目录后重启 Codex 才能看到。
-
-启用前创建 `.codex-sync/config` 和 `.codex-sync/catalog`，将网关 Key 保存到 `.codex-sync/config/api-key`（权限 `600`），将现有 Codex 模型目录复制为 `.codex-sync/config/template.json`；没有目录时使用 `{"models":[]}`。模板按模型 ID 保留上下文、推理能力等元数据，未知模型使用保守默认值，不推断其能力。上述本地文件均不进入版本控制。
-
-在项目根目录 `.env` 中设置 `COMPOSE_PROFILES=codex`，并按 `id -u` / `id -g` 的输出设置 `CODEX_SYNC_UID` 和 `CODEX_SYNC_GID`（默认均为 `1000`），确保同步服务能读取配置目录并写入目录文件：
+**Linux Docker**：先在项目根目录创建唯一需要手工维护的密钥文件，然后运行部署入口。请先按上文配置好 Compose 的数据库、Redis 和 `SESSION_SECRET` 等必需设置。默认 Codex 网关地址为本机 `http://127.0.0.1:9000/v1`；端口或反向代理不同可设置 `NEW_API_CODEX_BASE_URL`。脚本按当前 UID/GID 启动同步容器，启动网关和同步服务，并完成首次同步。如果当前用户只能通过 `sudo docker` 访问 Docker，将命令写为 `DOCKER_WITH_SUDO=1 ./bin/deploy-codex-sync.sh`；不要直接以 root 用户运行整个脚本，以免写入 root 的 Codex 配置。
 
 ```bash
-docker compose up -d
-docker compose logs --tail 20 codex-model-sync
+mkdir -p -m 700 .codex-sync/config
+# 用编辑器将 New API Token 写入 .codex-sync/config/api-key，内容只有一行
+chmod 600 .codex-sync/config/api-key
+./bin/deploy-codex-sync.sh
 ```
 
-首次同步成功后，将 `~/.codex/config.toml` 顶层的 `model_catalog_json` 设置为本项目 `.codex-sync/catalog/models.json` 的绝对路径。Codex 的 provider 应使用同一个网关和 Key。目录更新自动进行，但 Codex 只在启动时加载该配置，已有进程需要重启才能刷新 `/model` 菜单。该同步仅提供模型发现，调用是否成功仍取决于上游的 Responses 和工具调用支持。
+**Windows exe**：安装 Go 1.25.1 与 Bun，在 PowerShell 中从仓库根目录执行。先用编辑器手工创建 `.codex-sync\config\api-key`，内容同上。脚本自动构建前端和 `newapi.exe`，写入 Codex 配置，启动网关，并等待首次模型目录同步。默认监听 9900；已有该目录的 `newapi.exe` 正在运行时先停止它，再执行部署命令。
 
-需要立即同步时，在项目根目录执行：
+```powershell
+New-Item -ItemType Directory -Force .codex-sync\config | Out-Null
+# 用编辑器将 New API Token 写入 .codex-sync\config\api-key，内容只有一行
+powershell -ExecutionPolicy Bypass -File .\bin\deploy-codex-sync.ps1
+```
+
+Windows 可用 `-Port 9901` 改端口；只编译和配置、不启动时传入 `-NoStart`。Windows Codex 需要通过 `powershell -ExecutionPolicy Bypass -File .\bin\start-codex-with-new-api-key.ps1` 启动，脚本在进程内从 `api-key` 导入 `NEW_API_KEY`，无需额外创建 `.codex/newapi.env`。Linux SSH Codex 的重启脚本也会导入同一文件；普通 Linux CLI 可用 `./bin/start-codex-with-new-api-key.sh` 启动。生成的 Codex provider 使用 `env_key = "NEW_API_KEY"` 与 Responses 协议；目录仅提供模型发现，实际调用仍取决于上游的 Responses 和工具支持。
+
+Linux 同步服务启动时同步一次，之后每小时查询 `/v1/models`。需要立刻同步，或通过 SSH 在远端同步并重启当前用户的 Codex app-server，可运行：
 
 ```bash
 ./bin/sync-codex-models.sh
+ssh a100 '~/new-api/bin/restart-codex-app-server.sh'
 ```
 
-该命令启动临时容器执行一次同步，完成后自动删除容器，不改变每小时自动查询的计划。网关必须已启动，并已准备上述配置文件。也可从任意目录通过脚本的绝对路径调用；失败时返回非零退出码，未变化时不重写模型目录。同步完成后重新启动 Codex，即可加载更新后的菜单。
-
-使用 SSH 连接持久化 Codex app-server daemon 时，重连 SSH 可能只重新连接代理，后台进程仍保留旧目录。在服务器的普通 SSH 终端中执行以下命令，可同步并尝试重启当前用户的受管 daemon：
-
-```bash
-./bin/sync-codex-models.sh --restart-codex
-```
-
-该选项仅在同步成功且 `codex app-server daemon version` 报告 `backend` 为 `pid` 时重启。重启会中断该 daemon 上正在执行的任务；命令完成后重新连接客户端。独立运行的 Codex CLI 或 IDE 进程仍需退出后重新打开。请使用运行 Codex 的同一用户和 `CODEX_HOME`，避免操作其他配置目录。
-
-如果脚本报告 `unmanaged app-server`，说明该服务由 Codex SSH 客户端的代理进程启动，`codex app-server daemon restart` 和 `bootstrap` 都不能接管。先退出连接该服务器的 Codex 客户端，在另一个普通 SSH 终端中用 `ps -u "$USER" -o pid,args | grep '[c]odex app-server --listen'` 找到当前用户的 app-server 进程，确认命令和 PID 后执行 `kill <PID>`，再重新连接客户端。关闭客户端可防止代理立即重新启动旧服务；不要用 `pkill codex`，它会影响同一用户的其他会话。完成后在新进程中检查模型菜单。
+第二条命令需要把 `~/new-api` 换成远端实际仓库路径，并用运行 Codex 的同一用户执行。远端需要 `sudo docker` 时使用 `ssh a100 'DOCKER_WITH_SUDO=1 ~/new-api/bin/restart-codex-app-server.sh'`。受管 daemon 会被重启；SSH 客户端启动的非受管 app-server 会由脚本处理，完成后重新连接客户端。重启会中断该 app-server 上的任务；单独运行的 Codex CLI 或 IDE 需要退出并重新打开。Windows 则关闭原 Codex 进程，再通过上述密钥启动脚本打开。
 
 ### 存储与配置
 

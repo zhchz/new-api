@@ -37,7 +37,7 @@ func startWindowsCodexModelSync(port string) {
 		return
 	}
 	root := filepath.Dir(executable)
-	keyPath := filepath.Join(root, ".codex", "newapi.env")
+	keyPath := filepath.Join(root, ".codex-sync", "config", "api-key")
 	templatePath := filepath.Join(root, ".codex-sync", "config", "template.json")
 	outputPath := filepath.Join(root, ".codex-sync", "catalog", "models.json")
 	baseURL := "http://127.0.0.1:" + port + "/v1"
@@ -73,13 +73,7 @@ func syncCodexModelCatalog(ctx context.Context, client *http.Client, baseURL, ke
 	if len(keyFile) > 4096 {
 		return 0, false, errors.New("gateway key file too large")
 	}
-	apiKey := ""
-	for line := range strings.SplitSeq(strings.TrimPrefix(string(keyFile), "\ufeff"), "\n") {
-		name, value, found := strings.Cut(line, "=")
-		if found && strings.TrimSpace(name) == "NEW_API_KEY" {
-			apiKey = strings.TrimSpace(value)
-		}
-	}
+	apiKey := strings.TrimSpace(strings.TrimPrefix(string(keyFile), "\ufeff"))
 	if apiKey == "" || strings.ContainsAny(apiKey, "\r\n") {
 		return 0, false, errors.New("NEW_API_KEY is missing or invalid")
 	}

@@ -139,7 +139,10 @@ def sync_once(base_url, api_key_file, output, template_file=None):
     names = fetch_models(base_url, api_key_file)
     template = {"models": []}
     if template_file is not None:
-        template = json.loads(Path(template_file).read_text())
+        try:
+            template = json.loads(Path(template_file).read_text())
+        except FileNotFoundError:
+            pass
     catalog = build_catalog(names, template)
     encoded = (json.dumps(catalog, ensure_ascii=False, indent=2) + "\n").encode()
     output = Path(output)

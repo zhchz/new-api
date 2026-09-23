@@ -33,16 +33,36 @@ fi
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd -- "$project_root"
+export CODEX_SYNC_UID="${CODEX_SYNC_UID:-$(id -u)}"
+export CODEX_SYNC_GID="${CODEX_SYNC_GID:-$(id -g)}"
 
-docker compose run --rm --no-deps -T codex-model-sync \
-  python -B /app/codex_model_sync.py \
-  --once \
-  --base-url http://new-api:3000/v1 \
-  --api-key-file /config/api-key \
-  --template /config/template.json \
-  --output /catalog/models.json
+sync_args=(compose run --rm --no-deps -T codex-model-sync
+  python -B /app/codex_model_sync.py
+  --once
+  --base-url http://new-api:3000/v1
+  --api-key-file /config/api-key
+  --template /config/template.json
+  --output /catalog/models.json)
+if [[ "${DOCKER_WITH_SUDO:-0}" == "1" ]]; then
+  sudo CODEX_SYNC_UID="$CODEX_SYNC_UID" CODEX_SYNC_GID="$CODEX_SYNC_GID" docker "${sync_args[@]}"
+else
+  docker "${sync_args[@]}"
+fi
 
 if "$restart_codex"; then
+  if [[ -z "${NEW_API_KEY:-}" ]]; then
+    key_file="$project_root/.codex-sync/config/api-key"
+    if [[ ! -r "$key_file" ]]; then
+      printf 'Gateway key file is unavailable: %s\n' "$key_file" >&2
+      exit 1
+    fi
+    NEW_API_KEY="$(<"$key_file")"
+  fi
+  if [[ -z "$NEW_API_KEY" || "$NEW_API_KEY" == *$'\n'* || "$NEW_API_KEY" == *$'\r'* ]]; then
+    printf 'Gateway key file is empty or invalid.\n' >&2
+    exit 1
+  fi
+  export NEW_API_KEY
   daemon_status="$(codex app-server daemon version)" || exit $?
   if ! python3 -c 'import json, sys; sys.exit(json.load(sys.stdin).get("backend") != "pid")' <<< "$daemon_status"; then
     printf '%s\n' \

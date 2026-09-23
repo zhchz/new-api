@@ -25,7 +25,8 @@ command -v codex >/dev/null
 command -v python3 >/dev/null
 
 codex_home_path="${CODEX_HOME:-${HOME}/.codex}"
-sync_script="${CODEX_MODEL_SYNC_SCRIPT:-/home/zz/workspace/app/new-api/bin/sync-codex-models.sh}"
+project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+sync_script="${CODEX_MODEL_SYNC_SCRIPT:-$project_root/bin/sync-codex-models.sh}"
 if ! "$dry_run"; then
   if [[ ! -x "$sync_script" ]]; then
     printf 'Model sync script is missing or not executable: %s\n' "$sync_script" >&2
@@ -49,14 +50,14 @@ PY
 )"
 
 if ! "$dry_run" && [[ -z "${NEW_API_KEY:-}" ]]; then
-  gateway_key_file="/home/zz/workspace/app/new-api/.codex-sync/config/api-key"
+  gateway_key_file="$project_root/.codex-sync/config/api-key"
   if [[ ! -r "$gateway_key_file" ]]; then
     printf 'NEW_API_KEY is unset and the gateway key file is unavailable.\n' >&2
     exit 1
   fi
   NEW_API_KEY="$(<"$gateway_key_file")"
-  if [[ -z "$NEW_API_KEY" ]]; then
-    printf 'The gateway key file is empty.\n' >&2
+  if [[ -z "$NEW_API_KEY" || "$NEW_API_KEY" == *$'\n'* || "$NEW_API_KEY" == *$'\r'* ]]; then
+    printf 'The gateway key file is empty or invalid.\n' >&2
     exit 1
   fi
   export NEW_API_KEY
