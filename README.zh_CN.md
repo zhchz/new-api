@@ -230,7 +230,7 @@ notepad .codex-sync\config\api-key
 # 将占位符替换为单行真实密钥并保存（不要提交到版本库）
 ```
 
-Windows 网关发现密钥已替换后约 10 秒内重试模型同步；确认 `.codex-sync\catalog\models.last-success` 的更新时间晚于粘贴密钥、模型目录已更新，再启动 Codex。密钥文件仍是占位符时，Codex 启动脚本会拒绝运行。
+Windows 部署只等待网关的 `/api/status` 健康检查，不以模型同步成功作为启动条件。若已有密钥无效，网关日志会记录 HTTP 401；在管理控制台生成新的 API Key 并替换 `.codex-sync\config\api-key`，同步失败时旧目录会保留。占位符替换后约 10 秒内重试；已有无效密钥替换后最多等待 5 分钟，或重启网关立即重试。确认 `.codex-sync\catalog\models.last-success` 的更新时间晚于粘贴密钥、模型目录已更新，再启动 Codex。密钥文件仍是占位符时，Codex 启动脚本会拒绝运行。
 
 Windows 可用 `-Port 9901` 改端口；只编译和配置、不启动时传入 `-NoStart`。Windows Codex 需要通过 `powershell -ExecutionPolicy Bypass -File .\bin\start-codex-with-new-api-key.ps1` 启动，脚本在进程内从 `api-key` 导入 `NEW_API_KEY`，无需额外创建 `.codex/newapi.env`。Linux SSH Codex 的重启脚本也会导入同一文件；普通 Linux CLI 可用 `./bin/start-codex-with-new-api-key.sh` 启动。生成的 Codex provider 使用 `env_key = "NEW_API_KEY"` 与 Responses 协议；目录仅提供模型发现，实际调用仍取决于上游的 Responses 和工具支持。
 

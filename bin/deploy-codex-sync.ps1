@@ -127,42 +127,54 @@ if ($updated -ne $(if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllT
         if (-not (Test-Path -LiteralPath $backup)) { Copy-Item -LiteralPath $configPath -Destination $backup }
     }
     $temporary = Join-Path $codexHome ('.config-' + [guid]::NewGuid().ToString('N'))
+    $replacementBackup = Join-Path $codexHome ('.config-replaced-' + [guid]::NewGuid().ToString('N'))
+    $replaced = $false
     try {
         [IO.File]::WriteAllText($temporary, $updated, $utf8)
         if (Test-Path -LiteralPath $configPath) {
-            [IO.File]::Replace($temporary, $configPath, $null)
+            [IO.File]::Replace($temporary, $configPath, $replacementBackup)
+            $replaced = $true
         } else {
             [IO.File]::Move($temporary, $configPath)
         }
     } finally {
         if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary }
+        if ($replaced -and (Test-Path -LiteralPath $replacementBackup)) {
+            Remove-Item -LiteralPath $replacementBackup
+        }
     }
 }
+$startedAt = Get-Date
 if (-not $NoStart) {
-    $startedAt = Get-Date
     $process = Start-Process -FilePath $exePath -WorkingDirectory $root -WindowStyle Hidden -PassThru
-    if ($keyPending) {
-        Start-Sleep -Seconds 2
+    $deadline = (Get-Date).AddSeconds(90)
+    $ready = $false
+    while ((Get-Date) -lt $deadline) {
         if ($process.HasExited) { throw 'Gateway exited after launch; check its startup configuration and logs' }
-    } else {
-        $markerPath = Join-Path $root '.codex-sync\catalog\models.last-success'
-        $deadline = (Get-Date).AddSeconds(90)
-        while ((Get-Date) -lt $deadline -and
-            (-not (Test-Path -LiteralPath $markerPath) -or (Get-Item -LiteralPath $markerPath).LastWriteTime -lt $startedAt)) {
-            if ($process.HasExited) { throw 'Gateway exited before model catalog sync; check its startup configuration and logs' }
-            Start-Sleep -Seconds 2
+        try {
+            $response = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/api/status" -UseBasicParsing -TimeoutSec 2
+            $status = $response.Content | ConvertFrom-Json
+            if ($response.StatusCode -eq 200 -and $status.success -eq $true) {
+                $ready = $true
+                break
+            }
+        } catch {
+            # The gateway may still be starting.
         }
-        if (-not (Test-Path -LiteralPath $markerPath) -or
-            (Get-Item -LiteralPath $markerPath).LastWriteTime -lt $startedAt) {
-            throw 'Gateway started, but model catalog was not generated within 90 seconds'
-        }
+        Start-Sleep -Seconds 2
     }
+    if (-not $ready) { throw 'Gateway did not become ready within 90 seconds; check its startup logs' }
 }
+$markerPath = Join-Path $root '.codex-sync\catalog\models.last-success'
+$syncComplete = -not $NoStart -and (Test-Path -LiteralPath $markerPath) -and
+    (Get-Item -LiteralPath $markerPath).LastWriteTime -ge $startedAt
 Write-Host "Gateway address: http://127.0.0.1:$Port"
 Write-Host "Catalog: $catalogPath"
 if ($keyPending) {
-    Write-Host "After the gateway is running, create an API key in its console and replace the placeholder in $keyPath. The catalog sync will retry automatically."
-    Write-Host 'After the catalog sync succeeds, start Codex through bin\start-codex-with-new-api-key.ps1.'
-} else {
-    Write-Host 'Restart Codex through bin\start-codex-with-new-api-key.ps1 to load its key and model menu.'
+    Write-Host "Create an API key in the gateway console and replace the placeholder in $keyPath. Model sync will retry automatically."
+} elseif ($syncComplete) {
+    Write-Host 'Model catalog synchronized successfully.'
+} elseif (-not $NoStart) {
+    Write-Warning "Gateway is ready, but model sync is pending. Check the gateway logs for a 401; if the key is invalid, replace $keyPath with a valid API key. Failed syncs retry in up to five minutes."
 }
+Write-Host 'After model sync succeeds, start Codex through bin\start-codex-with-new-api-key.ps1.'

@@ -499,14 +499,20 @@ class WindowsExeDeploymentTests(unittest.TestCase):
                           (codex_home / "config.toml").read_text())
 
             key.write_text("test-gateway-token\n")
-            second = subprocess.run(args, env=environment, text=True,
+            changed_port = [*args[:-1], command.replace("-Port 9901", "-Port 9902")]
+            second = subprocess.run(changed_port, env=environment, text=True,
                                     capture_output=True, timeout=20)
             self.assertEqual(second.returncode, 0, second.stderr)
             self.assertEqual(key.read_text(), "test-gateway-token\n")
+            self.assertIn('base_url = "http://127.0.0.1:9902/v1"',
+                          (codex_home / "config.toml").read_text())
+            self.assertIn('base_url = "http://127.0.0.1:9901/v1"',
+                          (codex_home / "config.toml.codex-sync-backup").read_text())
+            self.assertFalse(list(codex_home.glob(".config-replaced-*")))
             self.assertFalse((root / ".codex-sync/catalog/models.last-success").exists())
 
             key.write_text("")
-            third = subprocess.run(args, env=environment, text=True,
+            third = subprocess.run(changed_port, env=environment, text=True,
                                    capture_output=True, timeout=20)
             self.assertEqual(third.returncode, 0, third.stderr)
             self.assertEqual(key.read_text().strip(), "REPLACE_WITH_NEW_API_KEY")
@@ -519,6 +525,20 @@ class WindowsExeDeploymentTests(unittest.TestCase):
             )
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("Invalid gateway key", rejected.stderr)
+
+            key.write_text("test-gateway-token\n")
+            start_command = (
+                "function Start-Process { [pscustomobject]@{HasExited=$false} }; "
+                'function Invoke-WebRequest { [pscustomobject]@{StatusCode=200; Content=\'{"success":true}\'} }; '
+                + command.replace("-NoStart ", "")
+            )
+            started = subprocess.run(
+                [*args[:-1], start_command], env=environment, text=True,
+                capture_output=True, timeout=20,
+            )
+            self.assertEqual(started.returncode, 0, started.stderr)
+            self.assertIn("model sync is pending", started.stdout + started.stderr)
+            self.assertFalse((root / ".codex-sync/catalog/models.last-success").exists())
 
 
 if __name__ == "__main__":
