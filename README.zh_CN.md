@@ -210,6 +210,8 @@ docker compose logs -f new-api
 
 ### 本机 Codex 模型菜单同步
 
+Windows 直接启动 `newapi.exe` 时，程序会从 exe 所在目录的 `.codex/newapi.env` 读取 `NEW_API_KEY=本机 New API Token`，启动后调用本机网关的 `/v1/models`，成功后每小时同步一次，失败时每 5 分钟重试。目录写入 exe 所在目录的 `.codex-sync/catalog/models.json`；不需要 Docker 或额外启动脚本。将 Codex 用户配置中的 `model_catalog_json` 指向这个文件，目录更新后手动重启 Codex 即可加载新模型。Windows 通道若需使用宿主机代理，应配置 `http://127.0.0.1:7890`。
+
 可选的 `codex-model-sync` Compose 服务在启动时同步一次，之后每小时调用网关的 `/v1/models`，将当前网关 Key 可见的模型同步为 Codex 本地模型目录。仅当目录内容发生变化时才写入，未变化时保留文件内容和修改时间。显式声明不支持 Responses 的模型不会出现在目录中；模型删除也会同步。请求失败时保留上次成功的目录，不会写入 API Key。
 
 `step-5-preview` 的目录元数据提供 `low`、`medium`、`high` 三档思考强度，默认为 `medium`；其他未知模型仍不推断其推理能力。

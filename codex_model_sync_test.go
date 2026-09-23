@@ -1,0 +1,114 @@
+package main
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+
+	"sync"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestSyncCodexModelCatalog(t *testing.T) {
+	var mu sync.Mutex
+	status := http.StatusOK
+	payload := `{"data":[{"id":"model-b"},{"id":"model-a"},{"id":"model-b"},{"id":"image","supported_endpoint_types":["image-generation"]},{"id":"step-5-preview","supported_endpoint_types":["openai-response"]}]}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/v1/models", r.URL.Path)
+		assert.Equal(t, "Bearer test-gateway-token", r.Header.Get("Authorization"))
+		mu.Lock()
+		currentStatus, currentPayload := status, payload
+		mu.Unlock()
+		w.WriteHeader(currentStatus)
+		_, _ = w.Write([]byte(currentPayload))
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	keyPath := filepath.Join(root, ".codex", "newapi.env")
+	outputPath := filepath.Join(root, ".codex-sync", "catalog", "models.json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(keyPath), 0700))
+	require.NoError(t, os.MkdirAll(filepath.Dir(outputPath), 0700))
+	require.NoError(t, os.WriteFile(keyPath, []byte("NEW_API_KEY=test-gateway-token\n"), 0600))
+	require.NoError(t, os.WriteFile(outputPath, []byte(`{"models":[{"slug":"model-a","context_window":12345,"visibility":"hide","supported_in_api":false}]}`), 0600))
+	templatePath := filepath.Join(root, ".codex-sync", "config", "template.json")
+	baseURL := server.URL + "/v1"
+
+	count, changed, err := syncCodexModelCatalog(context.Background(), server.Client(), baseURL, keyPath, templatePath, outputPath)
+	require.NoError(t, err)
+	assert.Equal(t, 3, count)
+	assert.True(t, changed)
+	first, err := os.ReadFile(outputPath)
+	require.NoError(t, err)
+	assert.NotContains(t, string(first), "test-gateway-token")
+	var catalog struct {
+		Models []map[string]any `json:"models"`
+	}
+	require.NoError(t, common.Unmarshal(first, &catalog))
+	require.Len(t, catalog.Models, 3)
+	assert.Equal(t, []string{"model-a", "model-b", "step-5-preview"}, []string{
+		catalog.Models[0]["slug"].(string), catalog.Models[1]["slug"].(string), catalog.Models[2]["slug"].(string),
+	})
+	assert.Equal(t, float64(12345), catalog.Models[0]["context_window"])
+	assert.Equal(t, "list", catalog.Models[0]["visibility"])
+	assert.Equal(t, true, catalog.Models[0]["supported_in_api"])
+	assert.Equal(t, "medium", catalog.Models[2]["default_reasoning_level"])
+	assert.FileExists(t, filepath.Join(filepath.Dir(outputPath), "models.last-success"))
+
+	info, err := os.Stat(outputPath)
+	require.NoError(t, err)
+	count, changed, err = syncCodexModelCatalog(context.Background(), server.Client(), baseURL, keyPath, templatePath, outputPath)
+	require.NoError(t, err)
+	assert.Equal(t, 3, count)
+	assert.False(t, changed)
+	unchanged, err := os.Stat(outputPath)
+	require.NoError(t, err)
+	assert.Equal(t, info.ModTime(), unchanged.ModTime())
+
+	mu.Lock()
+	payload = `{"data":[{"id":"model-b"}]}`
+	mu.Unlock()
+	count, changed, err = syncCodexModelCatalog(context.Background(), server.Client(), baseURL, keyPath, templatePath, outputPath)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+	assert.True(t, changed)
+	updated, err := os.ReadFile(outputPath)
+	require.NoError(t, err)
+	require.NoError(t, common.Unmarshal(updated, &catalog))
+	require.Len(t, catalog.Models, 1)
+	assert.Equal(t, "model-b", catalog.Models[0]["slug"])
+
+	mu.Lock()
+	status = http.StatusUnauthorized
+	mu.Unlock()
+	_, _, err = syncCodexModelCatalog(context.Background(), server.Client(), baseURL, keyPath, templatePath, outputPath)
+	require.ErrorContains(t, err, "HTTP 401")
+	assert.NotContains(t, err.Error(), "test-gateway-token")
+	afterFailure, err := os.ReadFile(outputPath)
+	require.NoError(t, err)
+	assert.Equal(t, updated, afterFailure)
+
+}
+
+func TestSyncCodexModelCatalogRejectsInvalidResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"model-a","supported_endpoint_types":null}]}`))
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	keyPath := filepath.Join(root, "newapi.env")
+	outputPath := filepath.Join(root, "models.json")
+	require.NoError(t, os.WriteFile(keyPath, []byte("NEW_API_KEY=test-gateway-token\n"), 0600))
+	require.NoError(t, os.WriteFile(outputPath, []byte(`{"models":[]}`), 0600))
+	_, _, err := syncCodexModelCatalog(context.Background(), server.Client(), server.URL+"/v1", keyPath, filepath.Join(root, "missing-template.json"), outputPath)
+	require.ErrorContains(t, err, "invalid gateway model endpoints")
+	unchanged, err := os.ReadFile(outputPath)
+	require.NoError(t, err)
+	assert.Equal(t, `{"models":[]}`, string(unchanged))
+}
