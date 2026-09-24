@@ -8,24 +8,16 @@ $exePath = Join-Path $root 'newapi.exe'
 if (Get-Process -Name newapi -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exePath }) {
     throw 'Stop the existing newapi.exe from this directory before rebuilding'
 }
-New-Item -ItemType Directory -Force (Join-Path $root '.codex-sync\config') | Out-Null
+
 $keyPath = Join-Path $root '.codex-sync\config\api-key'
-$utf8 = New-Object System.Text.UTF8Encoding($false)
-$placeholder = 'REPLACE_WITH_NEW_API_KEY'
+New-Item -ItemType Directory -Force (Split-Path $keyPath) | Out-Null
 if (-not (Test-Path -LiteralPath $keyPath)) {
-    [IO.File]::WriteAllText($keyPath, $placeholder + "`n", $utf8)
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($keyPath, "REPLACE_WITH_NEW_API_KEY`n", $utf8)
 } elseif (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) {
     throw "Gateway key path is not a file: $keyPath"
 }
-$key = [IO.File]::ReadAllText($keyPath).Trim()
-if (-not $key) {
-    [IO.File]::WriteAllText($keyPath, $placeholder + "`n", $utf8)
-    $key = $placeholder
-}
-if ($key.Contains("`n") -or $key.Contains("`r")) {
-    throw 'Gateway key must contain one line'
-}
-$keyPending = $key -eq $placeholder
+
 if ($PSBoundParameters.ContainsKey('Port')) {
     if ($Port -lt 1 -or $Port -gt 65535) { throw 'Invalid port' }
     $env:PORT = "$Port"
@@ -53,100 +45,14 @@ if (-not $PSBoundParameters.ContainsKey('Port')) {
         }
     } finally { Pop-Location }
 }
-$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
-$configPath = Join-Path $codexHome 'config.toml'
-$original = if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllText($configPath) } else { '' }
-$start = '# BEGIN new-api model sync'
-$end = '# END new-api model sync'
-$providerStart = '# BEGIN new-api model sync provider'
-$providerEnd = '# END new-api model sync provider'
-foreach ($pair in @(@($start, $end), @($providerStart, $providerEnd))) {
-    $startCount = [regex]::Matches($original, '(?m)^' + [regex]::Escape($pair[0]) + '\r?$').Count
-    $endCount = [regex]::Matches($original, '(?m)^' + [regex]::Escape($pair[1]) + '\r?$').Count
-    if ($startCount -ne $endCount -or $startCount -gt 1) { throw 'Invalid managed block in Codex config' }
-}
-if ($original -match '(?m)^\[model_providers\.new_api_sync\]' -and -not $original.Contains($providerStart)) {
-    throw 'Existing model provider new_api_sync is not managed by this script'
-}
-$templatePath = Join-Path $root '.codex-sync\config\template.json'
-$catalogPath = Join-Path $root '.codex-sync\catalog\models.json'
-New-Item -ItemType Directory -Force (Split-Path $templatePath) | Out-Null
-New-Item -ItemType Directory -Force (Split-Path $catalogPath) | Out-Null
-if (-not (Test-Path -LiteralPath $templatePath)) {
-    $existingCatalog = $null
-    if ($original -match '(?m)^model_catalog_json\s*=\s*"([^"\r\n]+)"') {
-        $existingCatalog = ('"' + $matches[1] + '"') | ConvertFrom-Json
-    }
-    $template = '{"models":[]}'
-    if ($existingCatalog -and (Test-Path -LiteralPath $existingCatalog -PathType Leaf)) {
-        $template = [IO.File]::ReadAllText($existingCatalog)
-        $value = $template | ConvertFrom-Json
-        if ($value.models -isnot [array]) { throw 'Existing catalog cannot be used as template' }
-    }
-    [IO.File]::WriteAllText($templatePath, $template + "`n", $utf8)
-} else {
-    $value = [IO.File]::ReadAllText($templatePath) | ConvertFrom-Json
-    if ($value.models -isnot [array]) { throw 'Invalid existing model template' }
-}
-if (-not (Test-Path -LiteralPath $catalogPath)) {
-    [IO.File]::WriteAllText($catalogPath, "{`"models`":[]}`n", $utf8)
-}
-foreach ($pair in @(@($start, $end), @($providerStart, $providerEnd))) {
-    $pattern = '(?s)(?m)^' + [regex]::Escape($pair[0]) + '\r?\n.*?^' + [regex]::Escape($pair[1]) + '\r?\n?'
-    $original = [regex]::Replace($original, $pattern, '')
-}
-$lines = New-Object 'System.Collections.Generic.List[string]'
-$topLevel = $true
-foreach ($line in ($original -split "`r?`n")) {
-    if ($line -match '^\s*\[') { $topLevel = $false }
-    if ($topLevel -and $line -match '^\s*(model_provider|model_catalog_json)\s*=') { continue }
-    $lines.Add($line)
-}
-$remainder = ($lines -join "`n").Trim("`n", "`r")
-$quotedCatalog = $catalogPath.Replace('\', '\\').Replace('"', '\"')
-$baseUrl = "http://127.0.0.1:$Port/v1"
-$updated = @"
-$start
-model_provider = "new_api_sync"
-model_catalog_json = "$quotedCatalog"
-$end
-$remainder
+$portPath = Join-Path $root '.codex-sync\config\gateway-port'
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+[IO.File]::WriteAllText($portPath, "$Port`n", $utf8)
+$enabledPath = Join-Path $root '.codex-sync\config\auto-sync-enabled'
+if (Test-Path -LiteralPath $enabledPath) { Remove-Item -LiteralPath $enabledPath }
 
-$providerStart
-[model_providers.new_api_sync]
-name = "New API"
-base_url = "$baseUrl"
-env_key = "NEW_API_KEY"
-wire_api = "responses"
-$providerEnd
-"@ + "`n"
-if ($updated -ne $(if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllText($configPath) } else { '' })) {
-    New-Item -ItemType Directory -Force $codexHome | Out-Null
-    if (Test-Path -LiteralPath $configPath) {
-        $backup = Join-Path $codexHome 'config.toml.codex-sync-backup'
-        if (-not (Test-Path -LiteralPath $backup)) { Copy-Item -LiteralPath $configPath -Destination $backup }
-    }
-    $temporary = Join-Path $codexHome ('.config-' + [guid]::NewGuid().ToString('N'))
-    $replacementBackup = Join-Path $codexHome ('.config-replaced-' + [guid]::NewGuid().ToString('N'))
-    $replaced = $false
-    try {
-        [IO.File]::WriteAllText($temporary, $updated, $utf8)
-        if (Test-Path -LiteralPath $configPath) {
-            [IO.File]::Replace($temporary, $configPath, $replacementBackup)
-            $replaced = $true
-        } else {
-            [IO.File]::Move($temporary, $configPath)
-        }
-    } finally {
-        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary }
-        if ($replaced -and (Test-Path -LiteralPath $replacementBackup)) {
-            Remove-Item -LiteralPath $replacementBackup
-        }
-    }
-}
-$startedAt = Get-Date
 if (-not $NoStart) {
-    $process = Start-Process -FilePath $exePath -WorkingDirectory $root -WindowStyle Hidden -PassThru
+    $process = Start-Process -FilePath $exePath -WorkingDirectory $root -WindowStyle Normal -PassThru
     $deadline = (Get-Date).AddSeconds(90)
     $ready = $false
     while ((Get-Date) -lt $deadline) {
@@ -165,16 +71,5 @@ if (-not $NoStart) {
     }
     if (-not $ready) { throw 'Gateway did not become ready within 90 seconds; check its startup logs' }
 }
-$markerPath = Join-Path $root '.codex-sync\catalog\models.last-success'
-$syncComplete = -not $NoStart -and (Test-Path -LiteralPath $markerPath) -and
-    (Get-Item -LiteralPath $markerPath).LastWriteTime -ge $startedAt
 Write-Host "Gateway address: http://127.0.0.1:$Port"
-Write-Host "Catalog: $catalogPath"
-if ($keyPending) {
-    Write-Host "Create an API key in the gateway console and replace the placeholder in $keyPath. Model sync will retry automatically."
-} elseif ($syncComplete) {
-    Write-Host 'Model catalog synchronized successfully.'
-} elseif (-not $NoStart) {
-    Write-Warning "Gateway is ready, but model sync is pending. Check the gateway logs for a 401; if the key is invalid, replace $keyPath with a valid API key. Failed syncs retry in up to five minutes."
-}
-Write-Host 'After model sync succeeds, start Codex through bin\start-codex-with-new-api-key.ps1.'
+Write-Host "Create an API key and usable model channels, replace the placeholder in $keyPath, then restart Codex through bin\start-codex-with-new-api-key.ps1. Keep the gateway running."

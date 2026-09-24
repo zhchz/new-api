@@ -19,9 +19,12 @@ PROVIDER = "new_api_sync"
 
 def configure(project_root, codex_home, base_url):
     key = project_root / ".codex-sync/config/api-key"
-    if not key.is_file() or not key.read_text().strip():
+    if not key.is_file():
         raise ValueError(f"Create the gateway key file first: {key}")
-    if "\n" in key.read_text().strip() or "\r" in key.read_text().strip():
+    key_text = key.read_text().lstrip("\ufeff").strip()
+    if not key_text or key_text == "REPLACE_WITH_NEW_API_KEY":
+        raise ValueError(f"Create the gateway key file first: {key}")
+    if "\n" in key_text or "\r" in key_text:
         raise ValueError("Gateway key must be one line")
     config_path = codex_home / "config.toml"
     original = config_path.read_text() if config_path.exists() else ""

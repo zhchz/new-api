@@ -86,7 +86,7 @@ services:
       - --output
       - /catalog/models.json
       - --interval
-      - "3600"
+      - "14400"
     volumes:
       - ./bin/codex_model_sync.py:/app/codex_model_sync.py:ro
       - ./.codex-sync/config:/config:ro
@@ -97,7 +97,7 @@ services:
     networks:
       - new-api-network
     healthcheck:
-      test: ["CMD", "python", "-c", "import os,time; assert time.time()-os.stat('/catalog/models.last-success').st_mtime < 3720"]
+      test: ["CMD", "python", "-c", "import os,time; assert time.time()-os.stat('/catalog/models.last-success').st_mtime < 14520"]
       interval: 30s
       timeout: 5s
       retries: 3

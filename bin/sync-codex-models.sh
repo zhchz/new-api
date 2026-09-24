@@ -2,16 +2,21 @@
 set -euo pipefail
 
 restart_codex=false
+if_due=false
 for argument in "$@"; do
   case "$argument" in
     --restart-codex)
       restart_codex=true
       ;;
+    --if-due)
+      if_due=true
+      ;;
     -h|--help)
       printf '%s\n' \
-        'Usage: sync-codex-models.sh [--restart-codex]' \
-        'Sync the model catalog immediately; unchanged catalogs are not rewritten.' \
-        "--restart-codex restarts the current user's Codex app-server daemon after a successful sync." \
+        'Usage: sync-codex-models.sh [--restart-codex] [--if-due]' \
+        'Prepare Codex and sync models without restarting the gateway.' \
+        '--if-due skips a successful sync less than four hours old.' \
+        "--restart-codex syncs models and restarts the current user's Codex app-server daemon." \
         'Restarting interrupts active daemon tasks. Reconnect the client afterwards.' \
         'Standalone Codex CLI and IDE processes must be closed and reopened separately.'
       exit 0
@@ -22,7 +27,6 @@ for argument in "$@"; do
       ;;
   esac
 done
-
 if "$restart_codex"; then
   if ! command -v codex >/dev/null 2>&1; then
     printf 'codex is not installed or is not in PATH.\n' >&2
@@ -33,8 +37,42 @@ fi
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd -- "$project_root"
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+key_file="$project_root/.codex-sync/config/api-key"
+if [[ ! -s "$key_file" ]]; then
+  printf 'Create a gateway API key and save it to %s before restarting Codex.\n' "$key_file" >&2
+  exit 1
+fi
+chmod 600 -- "$key_file"
 export CODEX_SYNC_UID="${CODEX_SYNC_UID:-$(id -u)}"
 export CODEX_SYNC_GID="${CODEX_SYNC_GID:-$(id -g)}"
+if [[ "${DOCKER_WITH_SUDO:-0}" == "1" ]]; then
+  docker_command=(sudo CODEX_SYNC_UID="$CODEX_SYNC_UID" CODEX_SYNC_GID="$CODEX_SYNC_GID" docker)
+else
+  docker_command=(docker)
+fi
+
+compose_config="$("${docker_command[@]}" compose config --format json)"
+gateway_port="$(python3 -c '
+import json, os, sys
+service = json.load(sys.stdin)["services"]["new-api"]
+ports = [str(port.get("published", "")) for port in service.get("ports", [])
+         if port.get("protocol", "tcp") == "tcp"]
+if not os.environ.get("NEW_API_CODEX_BASE_URL") and (
+    len(ports) != 1 or not ports[0].isdigit() or not 1 <= int(ports[0]) <= 65535
+):
+    raise SystemExit("Compose new-api needs one fixed published TCP port or NEW_API_CODEX_BASE_URL")
+print(ports[0] if len(ports) == 1 else "")
+' <<< "$compose_config")"
+base_url="${NEW_API_CODEX_BASE_URL:-http://127.0.0.1:$gateway_port/v1}"
+if ! python3 "$project_root/bin/codex_model_sync.py" \
+  --base-url "$base_url" --api-key-file "$key_file" \
+  --output "$project_root/.codex-sync/catalog/models.json" --check-ready; then
+  printf 'The gateway key or model channels are not ready. Complete setup before restarting Codex.\n' >&2
+  exit 1
+fi
+python3 "$project_root/bin/configure_codex_sync.py" \
+  --project-root "$project_root" --codex-home "$codex_home" --base-url "$base_url"
 
 sync_args=(compose run --rm --no-deps -T codex-model-sync
   python -B /app/codex_model_sync.py
@@ -43,15 +81,14 @@ sync_args=(compose run --rm --no-deps -T codex-model-sync
   --api-key-file /config/api-key
   --template /config/template.json
   --output /catalog/models.json)
-if [[ "${DOCKER_WITH_SUDO:-0}" == "1" ]]; then
-  sudo CODEX_SYNC_UID="$CODEX_SYNC_UID" CODEX_SYNC_GID="$CODEX_SYNC_GID" docker "${sync_args[@]}"
-else
-  docker "${sync_args[@]}"
+if "$if_due"; then
+  sync_args+=(--if-due)
 fi
+"${docker_command[@]}" "${sync_args[@]}"
+"${docker_command[@]}" compose --profile codex up -d --no-deps codex-model-sync
 
 if "$restart_codex"; then
   if [[ -z "${NEW_API_KEY:-}" ]]; then
-    key_file="$project_root/.codex-sync/config/api-key"
     if [[ ! -r "$key_file" ]]; then
       printf 'Gateway key file is unavailable: %s\n' "$key_file" >&2
       exit 1

@@ -62,6 +62,14 @@ func main() {
 		fmt.Println(port)
 		return
 	}
+	if len(os.Args) == 2 && (os.Args[1] == "--sync-codex-models" || os.Args[1] == "--check-codex-models") {
+		_ = godotenv.Load(".env")
+		if err := runCodexModelSync(gatewayListeningPort(), os.Args[1] == "--check-codex-models"); err != nil {
+			fmt.Fprintln(os.Stderr, "Codex model sync: "+err.Error())
+			os.Exit(1)
+		}
+		return
+	}
 	startTime := time.Now()
 	kitutil.SetLogging(common.SysLog, func(message string) {
 		logger.LogError(nil, message)
@@ -233,7 +241,7 @@ func main() {
 	time.Sleep(100 * time.Millisecond)
 
 	common.LogStartupSuccess(startTime, port)
-	startWindowsCodexModelSync(port)
+	startWindowsCodexModelSyncWatcher(port)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)

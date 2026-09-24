@@ -9,6 +9,7 @@ import (
 
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/assert"
@@ -87,6 +88,20 @@ func TestSyncCodexModelCatalog(t *testing.T) {
 	require.NoError(t, common.Unmarshal(updated, &catalog))
 	require.Len(t, catalog.Models, 1)
 	assert.Equal(t, "model-b", catalog.Models[0]["slug"])
+	markerPath := filepath.Join(filepath.Dir(outputPath), "models.last-success")
+	markerBeforeEmpty, err := os.Stat(markerPath)
+	require.NoError(t, err)
+	mu.Lock()
+	payload = `{"data":[]}`
+	mu.Unlock()
+	_, _, err = syncCodexModelCatalog(context.Background(), server.Client(), baseURL, keyPath, templatePath, outputPath)
+	require.ErrorIs(t, err, errCodexGatewayModelsPending)
+	markerAfterEmpty, err := os.Stat(markerPath)
+	require.NoError(t, err)
+	assert.Equal(t, markerBeforeEmpty.ModTime(), markerAfterEmpty.ModTime())
+	stillPopulated, err := os.ReadFile(outputPath)
+	require.NoError(t, err)
+	assert.Equal(t, updated, stillPopulated)
 
 	mu.Lock()
 	status = http.StatusUnauthorized
@@ -97,6 +112,20 @@ func TestSyncCodexModelCatalog(t *testing.T) {
 	afterFailure, err := os.ReadFile(outputPath)
 	require.NoError(t, err)
 	assert.Equal(t, updated, afterFailure)
+}
+
+func TestCodexModelSyncDelay(t *testing.T) {
+	outputPath := filepath.Join(t.TempDir(), "models.json")
+	now := time.Date(2026, time.September, 24, 0, 0, 0, 0, time.UTC)
+	assert.Zero(t, codexModelSyncDelay(outputPath, now))
+	markerPath := filepath.Join(filepath.Dir(outputPath), "models.last-success")
+	require.NoError(t, os.WriteFile(outputPath, []byte(`{"models":[]}`), 0600))
+	require.NoError(t, os.WriteFile(markerPath, nil, 0600))
+	require.NoError(t, os.Chtimes(markerPath, now.Add(-time.Hour), now.Add(-time.Hour)))
+	assert.Equal(t, 3*time.Hour, codexModelSyncDelay(outputPath, now))
+	assert.Zero(t, codexModelSyncDelay(outputPath, now.Add(3*time.Hour)))
+	require.NoError(t, os.Remove(outputPath))
+	assert.Zero(t, codexModelSyncDelay(outputPath, now))
 }
 
 func TestSyncCodexModelCatalogAddsDocumentedReasoningEfforts(t *testing.T) {

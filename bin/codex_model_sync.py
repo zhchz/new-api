@@ -7,6 +7,7 @@ from pathlib import Path
 import signal
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,6 +31,8 @@ REASONING_EFFORT_DESCRIPTIONS = {
     "xhigh": "Extended reasoning for difficult tasks",
     "max": "Maximum reasoning for the hardest tasks",
 }
+SYNC_INTERVAL = 4 * 60 * 60
+KEY_PLACEHOLDER = "REPLACE_WITH_NEW_API_KEY"
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -46,10 +49,14 @@ def fetch_models(base_url, api_key_file):
         or parsed.password is not None
         or parsed.query
         or parsed.fragment
+        or (parsed.scheme == "http" and parsed.hostname not in ("127.0.0.1", "::1", "localhost", "new-api"))
     ):
         raise ValueError("invalid gateway base URL")
-    api_key = Path(api_key_file).read_text().strip()
-    if not api_key or "\n" in api_key or "\r" in api_key:
+    key_bytes = Path(api_key_file).read_bytes()
+    if len(key_bytes) > 4096:
+        raise ValueError("gateway API key file is too large")
+    api_key = key_bytes.decode("utf-8-sig").strip()
+    if not api_key or api_key == KEY_PLACEHOLDER or "\n" in api_key or "\r" in api_key:
         raise ValueError("missing or invalid gateway API key")
     request = urllib.request.Request(
         base_url.rstrip("/") + "/models",
@@ -83,6 +90,8 @@ def fetch_models(base_url, api_key_file):
             if endpoints and "openai-response" not in endpoints:
                 continue
         names.add(name)
+    if not names:
+        raise ValueError("no usable models are available for this key")
     return sorted(names)
 
 
@@ -162,23 +171,53 @@ def sync_once(base_url, api_key_file, output, template_file=None):
     return len(names), changed
 
 
+def sync_delay(output, interval, now):
+    if not Path(output).is_file():
+        return 0
+    try:
+        last_success = Path(output).with_suffix(".last-success").stat().st_mtime
+    except FileNotFoundError:
+        return 0
+    return max(0, min(interval, interval - (now - last_success)))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Sync New API models to a Codex model catalog")
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--api-key-file", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--template", help="Existing Codex catalog supplying per-model metadata")
-    parser.add_argument("--interval", type=int, default=3600)
+    parser.add_argument("--interval", type=int, default=SYNC_INTERVAL)
     parser.add_argument("--once", action="store_true")
+    parser.add_argument("--if-due", action="store_true", help="With --once, skip a successful sync less than four hours old")
+    parser.add_argument("--check-ready", action="store_true", help="Validate the key and available models without writing a catalog")
     args = parser.parse_args()
-    if args.interval < 1:
-        parser.error("--interval must be positive")
+    if args.interval < SYNC_INTERVAL:
+        parser.error("--interval must be at least four hours")
+    if args.once and args.check_ready:
+        parser.error("--once and --check-ready cannot be combined")
+    if args.if_due and not args.once:
+        parser.error("--if-due requires --once")
+    if args.check_ready:
+        try:
+            fetch_models(args.base_url, args.api_key_file)
+            return 0
+        except (OSError, ValueError, urllib.error.URLError):
+            return 1
+    if args.if_due and sync_delay(args.output, args.interval, time.time()) > 0:
+        return 0
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     logging.info("Model sync started; interval=%d seconds", args.interval)
     stopped = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stopped.set())
     signal.signal(signal.SIGINT, lambda *_: stopped.set())
     while not stopped.is_set():
+        if not args.once:
+            remaining = sync_delay(args.output, args.interval, time.time())
+            if remaining > 0:
+                stopped.wait(remaining)
+                if stopped.is_set():
+                    break
         try:
             count, changed = sync_once(
                 args.base_url, args.api_key_file, args.output, args.template
@@ -190,6 +229,10 @@ def main():
             logging.error("Model sync failed (%s); previous catalog retained", detail)
             if args.once:
                 return 1
+            if isinstance(error, (FileNotFoundError, ValueError, urllib.error.HTTPError)):
+                logging.info("Model sync inactive until the service is restarted")
+                stopped.wait()
+                return 0
         if args.once:
             return 0
         stopped.wait(args.interval)

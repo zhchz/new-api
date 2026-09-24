@@ -4,13 +4,14 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
 from unittest.mock import patch
 import urllib.error
 
-from codex_model_sync import build_catalog, sync_once
+from codex_model_sync import SYNC_INTERVAL, build_catalog, sync_delay, sync_once
 from configure_codex_sync import configure
 
 
@@ -62,8 +63,53 @@ class ModelSyncTests(unittest.TestCase):
         sync_once(self.base_url, self.key, self.output)
         self.assertEqual([model["slug"] for model in json.loads(self.output.read_text())["models"]], ["model-c"])
         self.server.payload = {"data": []}
+        with self.assertRaisesRegex(ValueError, "no usable models"):
+            sync_once(self.base_url, self.key, self.output)
+        self.assertEqual([model["slug"] for model in json.loads(self.output.read_text())["models"]], ["model-c"])
+
+    def test_pending_key_and_empty_models_never_write_catalog(self):
+        self.key.write_text("REPLACE_WITH_NEW_API_KEY\n")
+        with self.assertRaises(ValueError):
+            sync_once(self.base_url, self.key, self.output)
+        self.assertEqual(self.server.requests, [])
+        self.key.write_text("test-gateway-token")
+        self.server.payload = {"data": []}
+        with self.assertRaises(ValueError):
+            sync_once(self.base_url, self.key, self.output)
+        self.assertFalse(self.output.exists())
+
+    def test_plain_http_to_remote_host_is_rejected_before_sending_key(self):
+        with self.assertRaisesRegex(ValueError, "invalid gateway base URL"):
+            sync_once("http://example.com/v1", self.key, self.output)
+        self.assertEqual(self.server.requests, [])
+
+    def test_success_marker_limits_automatic_sync_across_restarts(self):
+        now = 1_800_000_000
+        self.assertEqual(sync_delay(self.output, SYNC_INTERVAL, now), 0)
+        marker = self.output.with_suffix(".last-success")
+        marker.parent.mkdir(parents=True)
+        self.output.write_text('{"models":[]}')
+        marker.touch()
+        os.utime(marker, (now - 3600, now - 3600))
+        self.assertEqual(sync_delay(self.output, SYNC_INTERVAL, now), 3 * 3600)
+        self.assertEqual(sync_delay(self.output, SYNC_INTERVAL, now + 3 * 3600), 0)
+        self.output.unlink()
+        self.assertEqual(sync_delay(self.output, SYNC_INTERVAL, now), 0)
+
+    def test_deployment_sync_waits_four_hours_after_success(self):
         sync_once(self.base_url, self.key, self.output)
-        self.assertEqual(json.loads(self.output.read_text()), {"models": []})
+        command = [sys.executable, str(Path(__file__).with_name("codex_model_sync.py")),
+                   "--base-url", self.base_url, "--api-key-file", str(self.key),
+                   "--output", str(self.output), "--once", "--if-due"]
+        recent = subprocess.run(command, text=True, capture_output=True, timeout=10)
+        self.assertEqual(recent.returncode, 0, recent.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        marker = self.output.with_suffix(".last-success")
+        old = marker.stat().st_mtime - SYNC_INTERVAL - 1
+        os.utime(marker, (old, old))
+        due = subprocess.run(command, text=True, capture_output=True, timeout=10)
+        self.assertEqual(due.returncode, 0, due.stderr)
+        self.assertEqual(len(self.server.requests), 2)
 
     def test_only_advertised_responses_or_unspecified_endpoints(self):
         self.server.payload = {"data": [
@@ -182,6 +228,19 @@ class ManualSyncCommandTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        source = Path(__file__).resolve().parent
+        for name in ("sync-codex-models.sh", "restart-codex-app-server.sh",
+                     "start-codex-with-new-api-key.sh", "configure_codex_sync.py",
+                     "codex_model_sync.py"):
+            target = bin_dir / name
+            target.write_bytes((source / name).read_bytes())
+            if name.endswith(".sh"):
+                target.chmod(0o700)
+        key = self.root / ".codex-sync/config/api-key"
+        key.parent.mkdir(parents=True)
+        key.write_text("test-gateway-token\n")
         self.calls = self.root / "calls"
         self.environment = {
             **os.environ,
@@ -189,18 +248,33 @@ class ManualSyncCommandTests(unittest.TestCase):
             "MOCK_CALLS": str(self.calls),
             "MOCK_DAEMON_STATUS": '{"backend":"pid"}',
             "NEW_API_KEY": "test-gateway-token",
+            "CODEX_HOME": str(self.root / "codex-home"),
         }
+        self.environment.pop("MOCK_COMPOSE_JSON", None)
+        self.environment.pop("NEW_API_CODEX_BASE_URL", None)
         commands = {
-            "docker": '#!/bin/sh\nprintf "docker %s\\n" "$*" >> "$MOCK_CALLS"\nexit "${MOCK_DOCKER_STATUS:-0}"\n',
+            "docker": '#!/bin/sh\nprintf "docker %s\\n" "$*" >> "$MOCK_CALLS"\n'
+                      'if [ "$*" = "compose config --format json" ]; then '
+                      'if [ -n "$MOCK_COMPOSE_JSON" ]; then printf "%s\\n" "$MOCK_COMPOSE_JSON"; '
+                      'else printf \'{"services":{"new-api":{"ports":[{"published":"9876","protocol":"tcp"}]}}}\\n\'; fi; fi\n'
+                      'case "$*" in compose\\ run*) exit "${MOCK_DOCKER_SYNC_STATUS:-0}" ;; esac\n'
+                      'exit "${MOCK_DOCKER_STATUS:-0}"\n',
             "codex": '#!/bin/sh\nprintf "codex %s\\n" "$*" >> "$MOCK_CALLS"\nif [ "$*" = "app-server daemon restart --help" ]; then exit 0; fi\nif [ "$*" = "app-server daemon version" ]; then printf "%s\\n" "$MOCK_DAEMON_STATUS"; exit 0; fi\nexit "${MOCK_CODEX_STATUS:-0}"\n',
         }
         for name, content in commands.items():
             executable = self.root / name
             executable.write_text(content)
             executable.chmod(0o700)
+        python = self.root / "python3"
+        python.write_text(
+            '#!/bin/sh\ncase "$1" in\n'
+            '  */codex_model_sync.py) exit "${MOCK_READY_STATUS:-0}" ;;\n'
+            f'esac\nexec "{sys.executable}" "$@"\n'
+        )
+        python.chmod(0o700)
 
     def run_sync(self, *arguments):
-        script = Path(__file__).resolve().with_name("sync-codex-models.sh")
+        script = self.root / "bin/sync-codex-models.sh"
         return subprocess.run(
             ["bash", str(script), *arguments], cwd=self.root,
             env=self.environment, text=True, capture_output=True, timeout=10,
@@ -210,31 +284,39 @@ class ManualSyncCommandTests(unittest.TestCase):
         result = self.run_sync()
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text().splitlines()
-        self.assertEqual(len(calls), 1)
-        self.assertTrue(calls[0].startswith("docker compose run --rm --no-deps -T codex-model-sync "))
-        self.assertIn(" --once ", calls[0])
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0], "docker compose config --format json")
+        self.assertTrue(calls[1].startswith("docker compose run --rm --no-deps -T codex-model-sync "))
+        self.assertIn(" --once ", calls[1])
+        self.assertEqual(calls[2], "docker compose --profile codex up -d --no-deps codex-model-sync")
+        self.assertIn('base_url = "http://127.0.0.1:9876/v1"',
+                      (self.root / "codex-home/config.toml").read_text())
+        self.assertFalse(any("up -d --no-deps new-api" in call for call in calls))
 
     def test_sudo_docker_keeps_current_user_for_catalog_files(self):
         sudo = self.root / "sudo"
-        sudo.write_text('#!/bin/sh\nprintf "sudo %s\\n" "$*" >> "$MOCK_CALLS"\n')
+        sudo.write_text('#!/bin/sh\nprintf "sudo %s\\n" "$*" >> "$MOCK_CALLS"\nshift 2\nexec "$@"\n')
         sudo.chmod(0o700)
         self.environment["DOCKER_WITH_SUDO"] = "1"
         result = self.run_sync()
         self.assertEqual(result.returncode, 0, result.stderr)
-        call = self.calls.read_text().strip()
-        self.assertIn(f"CODEX_SYNC_UID={os.getuid()}", call)
-        self.assertIn(f"CODEX_SYNC_GID={os.getgid()}", call)
-        self.assertIn(" docker compose run ", call)
+        calls = self.calls.read_text().splitlines()
+        self.assertTrue(any(f"CODEX_SYNC_UID={os.getuid()}" in call for call in calls))
+        self.assertTrue(any(f"CODEX_SYNC_GID={os.getgid()}" in call for call in calls))
+        self.assertTrue(any(" docker compose run " in call for call in calls))
 
     def test_explicit_restart_runs_after_successful_sync(self):
         result = self.run_sync("--restart-codex")
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text().splitlines()
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 6)
         self.assertEqual(calls[0], "codex app-server daemon restart --help")
-        self.assertTrue(calls[1].startswith("docker compose run "))
-        self.assertEqual(calls[2], "codex app-server daemon version")
-        self.assertEqual(calls[3], "codex app-server daemon restart")
+        self.assertEqual(calls[1], "docker compose config --format json")
+        self.assertTrue(calls[2].startswith("docker compose run "))
+        self.assertNotIn("--if-due", calls[2])
+        self.assertEqual(calls[3], "docker compose --profile codex up -d --no-deps codex-model-sync")
+        self.assertEqual(calls[4], "codex app-server daemon version")
+        self.assertEqual(calls[5], "codex app-server daemon restart")
 
     def test_unmanaged_server_is_not_restarted(self):
         self.environment["MOCK_DAEMON_STATUS"] = '{"status":"running","backend":null}'
@@ -242,12 +324,12 @@ class ManualSyncCommandTests(unittest.TestCase):
         self.assertEqual(result.returncode, 3)
         self.assertIn("unmanaged app-server", result.stderr)
         calls = self.calls.read_text().splitlines()
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 5)
         self.assertEqual(calls[-1], "codex app-server daemon version")
 
     def test_home_restart_syncs_before_restart(self):
         sync_script = self.root / "sync"
-        sync_script.write_text('#!/bin/sh\nprintf "sync\\n" >> "$MOCK_CALLS"\nexit "${MOCK_SYNC_STATUS:-0}"\n')
+        sync_script.write_text('#!/bin/sh\nprintf "sync %s\\n" "$*" >> "$MOCK_CALLS"\nexit "${MOCK_SYNC_STATUS:-0}"\n')
         sync_script.chmod(0o700)
         self.environment["CODEX_MODEL_SYNC_SCRIPT"] = str(sync_script)
         self.environment["NEW_API_KEY"] = "test-gateway-token"
@@ -264,12 +346,12 @@ class ManualSyncCommandTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls.read_text().splitlines(), [
-            "sync", "codex app-server daemon version", "codex app-server daemon restart",
+            "sync ", "codex app-server daemon version", "codex app-server daemon restart",
         ])
 
     def test_home_restart_stops_before_disrupting_sessions_if_sync_fails(self):
         sync_script = self.root / "sync"
-        sync_script.write_text('#!/bin/sh\nprintf "sync\\n" >> "$MOCK_CALLS"\nexit 17\n')
+        sync_script.write_text('#!/bin/sh\nprintf "sync %s\\n" "$*" >> "$MOCK_CALLS"\nexit 17\n')
         sync_script.chmod(0o700)
         self.environment["CODEX_MODEL_SYNC_SCRIPT"] = str(sync_script)
         script = Path(__file__).resolve().with_name("restart-codex-app-server.sh")
@@ -278,15 +360,35 @@ class ManualSyncCommandTests(unittest.TestCase):
             text=True, capture_output=True, timeout=10,
         )
         self.assertEqual(result.returncode, 17)
-        self.assertEqual(self.calls.read_text().splitlines(), ["sync"])
+        self.assertEqual(self.calls.read_text().splitlines(), ["sync "])
 
     def test_failed_sync_does_not_restart_codex(self):
-        self.environment["MOCK_DOCKER_STATUS"] = "17"
+        self.environment["MOCK_DOCKER_SYNC_STATUS"] = "17"
         result = self.run_sync("--restart-codex")
         self.assertEqual(result.returncode, 17)
         calls = self.calls.read_text().splitlines()
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
         self.assertNotIn("codex app-server daemon restart", calls)
+
+    def test_unready_models_leave_codex_and_gateway_running(self):
+        self.environment["MOCK_READY_STATUS"] = "1"
+        result = self.run_sync("--restart-codex")
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse((self.root / "codex-home/config.toml").exists())
+        self.assertEqual(self.calls.read_text().splitlines(), [
+            "codex app-server daemon restart --help",
+            "docker compose config --format json",
+        ])
+
+    def test_explicit_url_supports_unpublished_gateway(self):
+        self.environment["MOCK_COMPOSE_JSON"] = json.dumps({
+            "services": {"new-api": {"ports": []}}
+        })
+        self.environment["NEW_API_CODEX_BASE_URL"] = "https://proxy.example/v1"
+        result = self.run_sync("--if-due")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('base_url = "https://proxy.example/v1"',
+                      (self.root / "codex-home/config.toml").read_text())
 
     def test_restart_failure_is_reported(self):
         self.environment["MOCK_CODEX_STATUS"] = "18"
@@ -299,13 +401,11 @@ class ManualSyncCommandTests(unittest.TestCase):
         self.assertFalse(self.calls.exists())
 
     def test_linux_codex_launcher_reads_only_the_key_file(self):
-        key = self.root / ".codex-sync/config/api-key"
-        key.parent.mkdir(parents=True)
-        key.write_text("test-gateway-token\n")
         bin_dir = self.root / "bin"
-        bin_dir.mkdir()
         launcher = bin_dir / "start-codex-with-new-api-key.sh"
-        launcher.write_bytes(Path(__file__).resolve().with_name(launcher.name).read_bytes())
+        sync_script = bin_dir / "sync-codex-models.sh"
+        sync_script.write_text('#!/bin/sh\nprintf "sync %s\\n" "$*" >> "$MOCK_CALLS"\n')
+        sync_script.chmod(0o700)
         codex = self.root / "codex"
         codex.write_text('#!/bin/sh\nprintf "%s\\n" "$NEW_API_KEY"\n')
         codex.chmod(0o700)
@@ -313,6 +413,7 @@ class ManualSyncCommandTests(unittest.TestCase):
                                 text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "test-gateway-token")
+        self.assertEqual(self.calls.read_text().splitlines(), ["sync "])
 
 
 class CodexConfigurationTests(unittest.TestCase):
@@ -370,6 +471,12 @@ class CodexConfigurationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Create the gateway key"):
                 configure(root, codex_home, "http://127.0.0.1:9000/v1")
             self.assertEqual(config.read_text(), 'model = "existing"\n')
+            key = root / ".codex-sync/config/api-key"
+            key.parent.mkdir(parents=True)
+            key.write_text("REPLACE_WITH_NEW_API_KEY\n")
+            with self.assertRaisesRegex(ValueError, "Create the gateway key"):
+                configure(root, codex_home, "http://127.0.0.1:9000/v1")
+            self.assertEqual(config.read_text(), 'model = "existing"\n')
 
 
 @unittest.skipUnless(os.name == "posix", "Docker deployment uses POSIX shell paths")
@@ -382,7 +489,7 @@ class DockerDeploymentTests(unittest.TestCase):
         bin_dir.mkdir()
         source = Path(__file__).resolve().parent
         for name in ("deploy-codex-sync.sh", "sync-codex-models.sh",
-                     "configure_codex_sync.py"):
+                     "configure_codex_sync.py", "codex_model_sync.py"):
             (bin_dir / name).write_bytes((source / name).read_bytes())
             if name.endswith(".sh"):
                 (bin_dir / name).chmod(0o700)
@@ -401,6 +508,13 @@ class DockerDeploymentTests(unittest.TestCase):
             'esac\n'
         )
         docker.chmod(0o700)
+        python = self.root / "python3"
+        python.write_text(
+            '#!/bin/sh\ncase "$1" in\n'
+            '  */codex_model_sync.py) exit "${MOCK_READY_STATUS:-0}" ;;\n'
+            f'esac\nexec "{sys.executable}" "$@"\n'
+        )
+        python.chmod(0o700)
         self.environment = {
             **os.environ,
             "PATH": str(self.root) + os.pathsep + os.environ["PATH"],
@@ -417,17 +531,27 @@ class DockerDeploymentTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text().splitlines()
-        self.assertIn('base_url = "http://127.0.0.1:9876/v1"',
-                      (self.root / "codex-home/config.toml").read_text())
+        self.assertFalse((self.root / "codex-home/config.toml").exists())
         self.assertEqual(calls[:5], [
             "compose config --format json",
-            "build --pull -t new-api:test .",
+            "build --pull --build-arg GOPROXY=https://goproxy.cn,direct -t new-api:test .",
+            "compose --profile codex stop codex-model-sync",
             "compose up -d --no-deps --force-recreate new-api",
             "compose ps -q new-api",
-            "inspect -f {{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}} container-id",
         ])
-        self.assertEqual(calls[5], "compose --profile codex up -d --no-deps --force-recreate codex-model-sync")
-        self.assertTrue(calls[6].startswith("compose run --rm --no-deps -T codex-model-sync "))
+        self.assertEqual(calls[5], "inspect -f {{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}} container-id")
+        self.assertEqual(len(calls), 6)
+
+    def test_first_deploy_without_key_starts_only_gateway(self):
+        (self.root / ".codex-sync/config/api-key").unlink()
+        result = subprocess.run(
+            ["bash", str(self.root / "bin/deploy-codex-sync.sh")],
+            env=self.environment, text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("restart Codex", result.stdout)
+        self.assertFalse((self.root / "codex-home/config.toml").exists())
+        self.assertEqual(len(self.calls.read_text().splitlines()), 6)
 
     def test_failed_build_keeps_running_gateway_untouched(self):
         self.environment["MOCK_BUILD_STATUS"] = "17"
@@ -438,33 +562,20 @@ class DockerDeploymentTests(unittest.TestCase):
         self.assertEqual(result.returncode, 17)
         self.assertEqual(self.calls.read_text().splitlines(), [
             "compose config --format json",
-            "build --pull -t new-api:test .",
+            "build --pull --build-arg GOPROXY=https://goproxy.cn,direct -t new-api:test .",
         ])
 
-    def test_explicit_codex_url_allows_compose_without_published_port(self):
+    def test_deploy_does_not_require_codex_port_configuration(self):
         self.environment["MOCK_COMPOSE_JSON"] = json.dumps({
             "services": {"new-api": {"image": "new-api:test", "ports": []}}
         })
-        self.environment["NEW_API_CODEX_BASE_URL"] = "https://proxy.example/v1"
         result = subprocess.run(
             ["bash", str(self.root / "bin/deploy-codex-sync.sh")],
             env=self.environment, text=True, capture_output=True, timeout=10,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('base_url = "https://proxy.example/v1"',
-                      (self.root / "codex-home/config.toml").read_text())
-
-    def test_missing_published_port_fails_before_build(self):
-        self.environment["MOCK_COMPOSE_JSON"] = json.dumps({
-            "services": {"new-api": {"image": "new-api:test", "ports": []}}
-        })
-        result = subprocess.run(
-            ["bash", str(self.root / "bin/deploy-codex-sync.sh")],
-            env=self.environment, text=True, capture_output=True, timeout=10,
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("one fixed published TCP port", result.stderr)
-        self.assertEqual(self.calls.read_text().splitlines(), ["compose config --format json"])
+        self.assertFalse((self.root / "codex-home/config.toml").exists())
+        self.assertEqual(len(self.calls.read_text().splitlines()), 6)
 
 
 @unittest.skipUnless(os.name == "nt", "Windows PowerShell deployment")
@@ -490,13 +601,13 @@ class WindowsExeDeploymentTests(unittest.TestCase):
             self.assertEqual(first.returncode, 0, first.stderr)
             key = root / ".codex-sync/config/api-key"
             self.assertEqual(key.read_text().strip(), "REPLACE_WITH_NEW_API_KEY")
-            self.assertEqual(json.loads((root / ".codex-sync/catalog/models.json").read_text()),
-                             {"models": []})
+            self.assertEqual((root / ".codex-sync/config/gateway-port").read_text().strip(), "9901")
+            self.assertFalse((root / ".codex-sync/catalog/models.json").exists())
             self.assertFalse((root / ".codex-sync/catalog/models.last-success").exists())
-            self.assertIn('env_key = "NEW_API_KEY"',
-                          (codex_home / "config.toml").read_text())
-            self.assertIn('base_url = "http://127.0.0.1:9901/v1"',
-                          (codex_home / "config.toml").read_text())
+            self.assertFalse((codex_home / "config.toml").exists())
+
+            enabled = root / ".codex-sync/config/auto-sync-enabled"
+            enabled.touch()
 
             key.write_text("test-gateway-token\n")
             changed_port = [*args[:-1], command.replace("-Port 9901", "-Port 9902")]
@@ -504,18 +615,16 @@ class WindowsExeDeploymentTests(unittest.TestCase):
                                     capture_output=True, timeout=20)
             self.assertEqual(second.returncode, 0, second.stderr)
             self.assertEqual(key.read_text(), "test-gateway-token\n")
-            self.assertIn('base_url = "http://127.0.0.1:9902/v1"',
-                          (codex_home / "config.toml").read_text())
-            self.assertIn('base_url = "http://127.0.0.1:9901/v1"',
-                          (codex_home / "config.toml.codex-sync-backup").read_text())
-            self.assertFalse(list(codex_home.glob(".config-replaced-*")))
+            self.assertEqual((root / ".codex-sync/config/gateway-port").read_text().strip(), "9902")
+            self.assertFalse((codex_home / "config.toml").exists())
+            self.assertFalse(enabled.exists())
             self.assertFalse((root / ".codex-sync/catalog/models.last-success").exists())
 
             key.write_text("")
             third = subprocess.run(changed_port, env=environment, text=True,
                                    capture_output=True, timeout=20)
             self.assertEqual(third.returncode, 0, third.stderr)
-            self.assertEqual(key.read_text().strip(), "REPLACE_WITH_NEW_API_KEY")
+            self.assertEqual(key.read_text(), "")
             launcher = root / "bin/start-codex-with-new-api-key.ps1"
             launcher.write_bytes(Path(__file__).resolve().with_name(launcher.name).read_bytes())
             rejected = subprocess.run(
@@ -528,8 +637,10 @@ class WindowsExeDeploymentTests(unittest.TestCase):
 
             key.write_text("test-gateway-token\n")
             start_command = (
-                "function Start-Process { [pscustomobject]@{HasExited=$false} }; "
-                'function Invoke-WebRequest { [pscustomobject]@{StatusCode=200; Content=\'{"success":true}\'} }; '
+                "function Start-Process { param($FilePath, $WorkingDirectory, $WindowStyle, [switch]$PassThru) "
+                "if ($WindowStyle -ne 'Normal') { throw 'Gateway terminal is hidden' }; "
+                "[pscustomobject]@{HasExited=$false} }; "
+                'function Invoke-WebRequest { [pscustomobject]@{StatusCode=200; Content=\'{"success":true,"data":[{"id":"model-a"}]}\'} }; '
                 + command.replace("-NoStart ", "")
             )
             started = subprocess.run(
@@ -537,7 +648,9 @@ class WindowsExeDeploymentTests(unittest.TestCase):
                 capture_output=True, timeout=20,
             )
             self.assertEqual(started.returncode, 0, started.stderr)
-            self.assertIn("model sync is pending", started.stdout + started.stderr)
+            self.assertFalse((codex_home / "config.toml").exists())
+            self.assertFalse((root / ".codex-sync/catalog/models.json").exists())
+            self.assertEqual((root / ".codex-sync/config/gateway-port").read_text().strip(), "9901")
             self.assertFalse((root / ".codex-sync/catalog/models.last-success").exists())
 
 

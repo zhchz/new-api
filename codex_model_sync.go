@@ -19,26 +19,26 @@ import (
 )
 
 const codexCatalogResponseLimit = 8 << 20
+const codexModelSyncInterval = 4 * time.Hour
 
 const codexGatewayKeyPlaceholder = "REPLACE_WITH_NEW_API_KEY"
 
 var errCodexGatewayKeyPending = errors.New("gateway API key has not been configured")
+var errCodexGatewayModelsPending = errors.New("gateway has no usable models for this key")
+var errCodexGatewayUnauthorized = errors.New("gateway key is not authorized")
 
-// Windows uses the gateway executable as the only service entry point.
-// Linux keeps using the optional codex-model-sync Compose service.
-func startWindowsCodexModelSync(port string) {
-	if runtime.GOOS != "windows" {
-		return
-	}
+const codexModelSyncEnabledFile = "auto-sync-enabled"
+
+// Codex launchers call this after the gateway key and channels are configured.
+// The readiness mode never writes a catalog or activates automatic sync.
+func runCodexModelSync(port string, checkOnly bool) error {
 	portNumber, err := strconv.Atoi(port)
 	if err != nil || portNumber < 1 || portNumber > 65535 {
-		common.SysLog("Codex model sync disabled: invalid gateway port")
-		return
+		return errors.New("invalid gateway port")
 	}
 	executable, err := os.Executable()
 	if err != nil {
-		common.SysLog("Codex model sync disabled: executable path unavailable")
-		return
+		return errors.New("executable path unavailable")
 	}
 	root := filepath.Dir(executable)
 	keyPath := filepath.Join(root, ".codex-sync", "config", "api-key")
@@ -53,89 +53,167 @@ func startWindowsCodexModelSync(port string) {
 		},
 	}
 
+	if checkOnly {
+		_, err := fetchCodexGatewayModelNames(context.Background(), client, baseURL, keyPath)
+		return err
+	}
+	count, changed, err := syncCodexModelCatalog(context.Background(), client, baseURL, keyPath, templatePath, outputPath)
+	if err != nil {
+		return err
+	}
+	if changed {
+		fmt.Printf("Codex model catalog updated: %d models\n", count)
+	} else {
+		fmt.Printf("Codex model catalog checked: %d models\n", count)
+	}
+	return enableCodexModelSync(root)
+}
+
+func enableCodexModelSync(root string) error {
+	enabledPath := filepath.Join(root, ".codex-sync", "config", codexModelSyncEnabledFile)
+	if err := os.WriteFile(enabledPath, nil, 0600); err != nil {
+		return errors.New("cannot enable automatic Codex model sync")
+	}
+	return nil
+}
+
+// The gateway only watches for activation. A Codex launch creates the marker
+// after its first successful sync; no model request happens before that launch.
+func startWindowsCodexModelSyncWatcher(port string) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return
+	}
+	root := filepath.Dir(executable)
+	enabledPath := filepath.Join(root, ".codex-sync", "config", codexModelSyncEnabledFile)
+	keyPath := filepath.Join(root, ".codex-sync", "config", "api-key")
+	templatePath := filepath.Join(root, ".codex-sync", "config", "template.json")
+	outputPath := filepath.Join(root, ".codex-sync", "catalog", "models.json")
+	client := &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: &http.Transport{Proxy: nil},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return errors.New("gateway redirect refused")
+		},
+	}
+	baseURL := "http://127.0.0.1:" + port + "/v1"
 	go func() {
 		for {
-			count, changed, err := syncCodexModelCatalog(context.Background(), client, baseURL, keyPath, templatePath, outputPath)
-			if errors.Is(err, errCodexGatewayKeyPending) {
+			if _, err := os.Stat(enabledPath); err != nil {
 				time.Sleep(10 * time.Second)
+				continue
+			}
+			if delay := codexModelSyncDelay(outputPath, time.Now()); delay > 0 {
+				time.Sleep(min(delay, time.Minute))
+				continue
+			}
+			count, changed, err := syncCodexModelCatalog(context.Background(), client, baseURL, keyPath, templatePath, outputPath)
+			if errors.Is(err, errCodexGatewayKeyPending) || errors.Is(err, errCodexGatewayModelsPending) || errors.Is(err, errCodexGatewayUnauthorized) {
+				common.SysLog("Codex model sync paused; check the key and channels, then restart Codex")
+				_ = os.Remove(enabledPath)
 				continue
 			}
 			if err != nil {
 				common.SysLog("Codex model sync failed: " + err.Error() + "; previous catalog retained")
-				time.Sleep(5 * time.Minute)
+				time.Sleep(codexModelSyncInterval)
 				continue
 			}
 			if changed {
 				common.SysLog(fmt.Sprintf("Codex model catalog updated: %d models; restart Codex to load it", count))
 			}
-			time.Sleep(time.Hour)
 		}
 	}()
 }
 
-func syncCodexModelCatalog(ctx context.Context, client *http.Client, baseURL, keyPath, templatePath, outputPath string) (int, bool, error) {
+func readCodexGatewayKey(keyPath string) (string, error) {
 	keyFile, err := os.ReadFile(keyPath)
 	if err != nil {
-		return 0, false, errors.New("gateway key file unavailable")
+		return "", errCodexGatewayKeyPending
 	}
 	if len(keyFile) > 4096 {
-		return 0, false, errors.New("gateway key file too large")
+		return "", errors.New("gateway key file too large")
 	}
 	apiKey := strings.TrimSpace(strings.TrimPrefix(string(keyFile), "\ufeff"))
 	if apiKey == "" || apiKey == codexGatewayKeyPlaceholder {
-		return 0, false, errCodexGatewayKeyPending
+		return "", errCodexGatewayKeyPending
 	}
 	if strings.ContainsAny(apiKey, "\r\n") {
-		return 0, false, errors.New("NEW_API_KEY is missing or invalid")
+		return "", errors.New("NEW_API_KEY is missing or invalid")
+	}
+	return apiKey, nil
+}
+
+func codexModelSyncDelay(outputPath string, now time.Time) time.Duration {
+	if _, err := os.Stat(outputPath); err != nil {
+		return 0
+	}
+	markerPath := strings.TrimSuffix(outputPath, filepath.Ext(outputPath)) + ".last-success"
+	marker, err := os.Stat(markerPath)
+	if err != nil {
+		return 0
+	}
+	return max(0, min(codexModelSyncInterval, codexModelSyncInterval-now.Sub(marker.ModTime())))
+}
+
+func fetchCodexGatewayModelNames(ctx context.Context, client *http.Client, baseURL, keyPath string) ([]string, error) {
+	apiKey, err := readCodexGatewayKey(keyPath)
+	if err != nil {
+		return nil, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/models", nil)
 	if err != nil {
-		return 0, false, errors.New("invalid gateway URL")
+		return nil, errors.New("invalid gateway URL")
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Accept", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, false, fmt.Errorf("gateway request failed: %w", err)
+		return nil, fmt.Errorf("gateway request failed: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return 0, false, fmt.Errorf("gateway HTTP %d", resp.StatusCode)
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return nil, fmt.Errorf("gateway HTTP %d: %w", resp.StatusCode, errCodexGatewayUnauthorized)
+		}
+		return nil, fmt.Errorf("gateway HTTP %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, codexCatalogResponseLimit+1))
 	if err != nil || len(body) > codexCatalogResponseLimit {
-		return 0, false, errors.New("gateway model response unreadable or too large")
+		return nil, errors.New("gateway model response unreadable or too large")
 	}
 	var payload map[string]any
 	if err := common.Unmarshal(body, &payload); err != nil || payload == nil || payload["success"] == false {
-		return 0, false, errors.New("invalid gateway model response")
+		return nil, errors.New("invalid gateway model response")
 	}
 	upstream, ok := payload["data"].([]any)
 	if !ok {
-		return 0, false, errors.New("invalid gateway model list")
+		return nil, errors.New("invalid gateway model list")
 	}
 	names := make(map[string]struct{}, len(upstream))
 	for _, item := range upstream {
 		entry, ok := item.(map[string]any)
 		if !ok {
-			return 0, false, errors.New("invalid gateway model entry")
+			return nil, errors.New("invalid gateway model entry")
 		}
 		id, ok := entry["id"].(string)
 		name := strings.TrimSpace(id)
 		if !ok || name == "" || strings.IndexFunc(name, func(r rune) bool { return r < 32 }) >= 0 {
-			return 0, false, errors.New("invalid gateway model identifier")
+			return nil, errors.New("invalid gateway model identifier")
 		}
 		if rawEndpoints, present := entry["supported_endpoint_types"]; present {
 			endpoints, ok := rawEndpoints.([]any)
 			if !ok {
-				return 0, false, errors.New("invalid gateway model endpoints")
+				return nil, errors.New("invalid gateway model endpoints")
 			}
 			supported := len(endpoints) == 0
 			for _, value := range endpoints {
 				endpoint, ok := value.(string)
 				if !ok {
-					return 0, false, errors.New("invalid gateway model endpoints")
+					return nil, errors.New("invalid gateway model endpoints")
 				}
 				if endpoint == "openai-response" {
 					supported = true
@@ -151,7 +229,18 @@ func syncCodexModelCatalog(ctx context.Context, client *http.Client, baseURL, ke
 	for name := range names {
 		modelNames = append(modelNames, name)
 	}
+	if len(modelNames) == 0 {
+		return nil, errCodexGatewayModelsPending
+	}
 	slices.Sort(modelNames)
+	return modelNames, nil
+}
+
+func syncCodexModelCatalog(ctx context.Context, client *http.Client, baseURL, keyPath, templatePath, outputPath string) (int, bool, error) {
+	modelNames, err := fetchCodexGatewayModelNames(ctx, client, baseURL, keyPath)
+	if err != nil {
+		return 0, false, err
+	}
 
 	templateBytes, err := os.ReadFile(templatePath)
 	if errors.Is(err, os.ErrNotExist) {

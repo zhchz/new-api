@@ -13,4 +13,5 @@ if [[ -z "$NEW_API_KEY" || "$NEW_API_KEY" == *$'\n'* || "$NEW_API_KEY" == *$'\r'
   exit 1
 fi
 export NEW_API_KEY
+"$project_root/bin/sync-codex-models.sh"
 exec codex "$@"
