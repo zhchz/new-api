@@ -235,7 +235,7 @@ powershell -ExecutionPolicy Bypass -File .\bin\start-codex-with-new-api-key.ps1
 
 Windows 部署只等待网关的 `/api/status` 健康检查。密钥文件仍是占位符、密钥无效或模型渠道未就绪时，Codex 启动脚本会拒绝启动。修正 Key 和渠道后，再运行该脚本；无需重启网关。成功后可查看 `.codex-sync\catalog\models.last-success` 的更新时间。
 
-Windows 可用 `-Port 9901` 改端口；只编译、不启动时传入 `-NoStart`。Windows Codex 需要通过 `powershell -ExecutionPolicy Bypass -File .\bin\start-codex-with-new-api-key.ps1` 启动，脚本在进程内从 `api-key` 导入 `NEW_API_KEY`，无需额外创建 `.codex/newapi.env`。Linux SSH Codex 的重启脚本也会导入同一文件；普通 Linux CLI 可用 `./bin/start-codex-with-new-api-key.sh` 启动。生成的 Codex provider 使用 `env_key = "NEW_API_KEY"` 与 Responses 协议；目录仅提供模型发现，实际调用仍取决于上游的 Responses 和工具支持。
+Windows 可用 `-Port 9901` 改端口；只编译、不启动时传入 `-NoStart`。首次同步通过 `powershell -ExecutionPolicy Bypass -File .\bin\start-codex-with-new-api-key.ps1` 启动 Codex；生成的 Windows provider 使用 `auth.command` 调用 `bin\read-codex-api-key.ps1`，每次需要鉴权时从 `api-key` 文件读取密钥，因此桌面端后续新对话不依赖启动脚本注入 `NEW_API_KEY`。Linux SSH Codex 的重启脚本会导入同一文件；普通 Linux CLI 可用 `./bin/start-codex-with-new-api-key.sh` 启动，并通过 `env_key = "NEW_API_KEY"` 读取其进程环境变量。provider 使用 Responses 协议；目录仅提供模型发现，实际调用仍取决于上游的 Responses 和工具支持。
 
 Codex 每次通过上述脚本启动或重启时都会同步一次。首次成功后，Linux 同步容器和 Windows 网关内的后台任务每次成功同步至少间隔四小时。需要手动同步，或通过 SSH 在远端同步并重启当前用户的 Codex app-server，可运行：
 

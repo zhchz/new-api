@@ -11,7 +11,6 @@ if (-not [int]::TryParse($portText, [ref]$port) -or $port -lt 1 -or $port -gt 65
     throw "Invalid gateway port: $portPath. Run the gateway deployment script first."
 }
 $env:PORT = "$port"
-$env:NEW_API_KEY = $key
 $exePath = Join-Path $root 'newapi.exe'
 & $exePath --check-codex-models
 if ($LASTEXITCODE -ne 0) { throw 'The gateway key or model channels are not ready; Codex was not restarted' }

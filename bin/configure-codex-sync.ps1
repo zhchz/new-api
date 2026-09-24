@@ -58,6 +58,9 @@ foreach ($line in ($original -split "`r?`n")) {
 }
 $remainder = ($lines -join "`n").Trim("`n", "`r")
 $quotedCatalog = $catalogPath.Replace('\', '\\').Replace('"', '\"')
+$readKeyScript = Join-Path $PSScriptRoot 'read-codex-api-key.ps1'
+if (-not (Test-Path -LiteralPath $readKeyScript -PathType Leaf)) { throw "Missing Codex key reader: $readKeyScript" }
+$quotedReadKeyScript = $readKeyScript.Replace('\', '\\').Replace('"', '\"')
 $baseUrl = "http://127.0.0.1:$Port/v1"
 $updated = @"
 $start
@@ -70,8 +73,11 @@ $providerStart
 [model_providers.new_api_sync]
 name = "New API"
 base_url = "$baseUrl"
-env_key = "NEW_API_KEY"
 wire_api = "responses"
+
+[model_providers.new_api_sync.auth]
+command = "powershell.exe"
+args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "$quotedReadKeyScript"]
 $providerEnd
 "@ + "`n"
 if ($updated -ne $(if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllText($configPath) } else { '' })) {
@@ -92,9 +98,9 @@ if ($updated -ne $(if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllT
             [IO.File]::Move($temporary, $configPath)
         }
     } finally {
-        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary }
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
         if ($replaced -and (Test-Path -LiteralPath $replacementBackup)) {
-            Remove-Item -LiteralPath $replacementBackup
+            Remove-Item -LiteralPath $replacementBackup -Force
         }
     }
 }

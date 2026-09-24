@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import tomllib
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -580,6 +581,61 @@ class DockerDeploymentTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "Windows PowerShell deployment")
 class WindowsExeDeploymentTests(unittest.TestCase):
+    def test_codex_provider_reads_gateway_key_without_process_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            source = Path(__file__).resolve().parent
+            for name in ("configure-codex-sync.ps1", "read-codex-api-key.ps1"):
+                (bin_dir / name).write_bytes((source / name).read_bytes())
+            key = root / ".codex-sync/config/api-key"
+            key.parent.mkdir(parents=True)
+            key.write_text("test-gateway-token\n")
+            codex_home = root / "codex-home"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text(
+                '# BEGIN new-api model sync\n'
+                'model_provider = "new_api_sync"\n'
+                '# END new-api model sync\n'
+                'model = "gpt-6-sol"\n\n'
+                '# BEGIN new-api model sync provider\n'
+                '[model_providers.new_api_sync]\n'
+                'name = "New API"\n'
+                'base_url = "http://127.0.0.1:9900/v1"\n'
+                'env_key = "NEW_API_KEY"\n'
+                'wire_api = "responses"\n'
+                '# END new-api model sync provider\n'
+            )
+            environment = {**os.environ, "CODEX_HOME": str(codex_home)}
+            environment.pop("NEW_API_KEY", None)
+            configured = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", str(bin_dir / "configure-codex-sync.ps1"), "-Port", "9900"],
+                env=environment, text=True, capture_output=True, timeout=20,
+            )
+            self.assertEqual(configured.returncode, 0, configured.stderr)
+            config_text = (codex_home / "config.toml").read_text()
+            config = tomllib.loads(config_text)
+            provider = config["model_providers"]["new_api_sync"]
+            self.assertEqual(config["model_provider"], "new_api_sync")
+            self.assertEqual(config["model"], "gpt-6-sol")
+            self.assertNotIn("env_key", provider)
+            self.assertEqual(provider["auth"]["command"], "powershell.exe")
+            self.assertEqual(provider["auth"]["args"][-1], str(bin_dir / "read-codex-api-key.ps1"))
+            self.assertNotIn("test-gateway-token", config_text)
+            self.assertTrue(Path(config["model_catalog_json"]).is_file())
+
+            reader = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                      "-File", str(bin_dir / "read-codex-api-key.ps1")]
+            read = subprocess.run(reader, env=environment, text=True, capture_output=True, timeout=20)
+            self.assertEqual(read.returncode, 0, read.stderr)
+            self.assertEqual(read.stdout, "test-gateway-token")
+            key.write_text("REPLACE_WITH_NEW_API_KEY\n")
+            rejected = subprocess.run(reader, env=environment, text=True, capture_output=True, timeout=20)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertNotIn("test-gateway-token", rejected.stdout + rejected.stderr)
+
     def test_first_deploy_bootstraps_placeholder_without_requiring_a_token(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
