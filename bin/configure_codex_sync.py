@@ -10,6 +10,8 @@ import shutil
 import tempfile
 import tomllib
 
+from codex_model_sync import merge_reasoning_template
+
 START = "# BEGIN new-api model sync\n"
 END = "# END new-api model sync\n"
 PROVIDER_START = "# BEGIN new-api model sync provider\n"
@@ -39,21 +41,25 @@ def configure(project_root, codex_home, base_url):
     template = project_root / ".codex-sync/config/template.json"
     template.parent.mkdir(parents=True, exist_ok=True)
     catalog.parent.mkdir(parents=True, exist_ok=True)
-    if not template.exists():
-        source = parsed.get("model_catalog_json")
-        if source and Path(source).is_file():
-            data = json.loads(Path(source).read_text())
-            if not isinstance(data, dict) or not isinstance(data.get("models"), list):
-                raise ValueError("Existing model catalog cannot be used as a template")
-        else:
-            data = {"models": []}
-        with template.open("x", encoding="utf-8") as stream:
-            json.dump(data, stream, ensure_ascii=False, indent=2)
-            stream.write("\n")
+    if template.exists():
+        data = json.loads(template.read_text(encoding="utf-8-sig"))
     else:
-        data = json.loads(template.read_text())
-        if not isinstance(data, dict) or not isinstance(data.get("models"), list):
-            raise ValueError("Invalid existing model template")
+        source = parsed.get("model_catalog_json")
+        data = {"models": []}
+        if source and Path(source).is_file():
+            data = json.loads(Path(source).read_text(encoding="utf-8-sig"))
+    data = merge_reasoning_template(data)
+    encoded_template = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if not template.exists() or template.read_bytes() != encoded_template:
+        descriptor, temporary = tempfile.mkstemp(prefix=".template-", dir=template.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(encoded_template)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, template)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
 
     for start, end in ((START, END), (PROVIDER_START, PROVIDER_END)):
         if start in original:

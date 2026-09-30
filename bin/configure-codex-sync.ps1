@@ -13,7 +13,12 @@ $templatePath = Join-Path $root '.codex-sync\config\template.json'
 $catalogPath = Join-Path $root '.codex-sync\catalog\models.json'
 New-Item -ItemType Directory -Force (Split-Path $templatePath) | Out-Null
 New-Item -ItemType Directory -Force (Split-Path $catalogPath) | Out-Null
-if (-not (Test-Path -LiteralPath $templatePath)) {
+$bundledPath = Join-Path $PSScriptRoot 'codex-model-template.json'
+$bundled = [IO.File]::ReadAllText($bundledPath) | ConvertFrom-Json
+if ($bundled.models -isnot [array]) { throw 'Invalid bundled model template' }
+$hasTemplate = Test-Path -LiteralPath $templatePath
+$template = if ($hasTemplate) { [IO.File]::ReadAllText($templatePath) } else { '' }
+if (-not $hasTemplate) {
     $existingCatalog = $null
     if ($original -match '(?m)^model_catalog_json\s*=\s*"([^"\r\n]+)"') {
         $existingCatalog = ('"' + $matches[1] + '"') | ConvertFrom-Json
@@ -21,13 +26,46 @@ if (-not (Test-Path -LiteralPath $templatePath)) {
     $template = '{"models":[]}'
     if ($existingCatalog -and (Test-Path -LiteralPath $existingCatalog -PathType Leaf)) {
         $template = [IO.File]::ReadAllText($existingCatalog)
-        $value = $template | ConvertFrom-Json
-        if ($value.models -isnot [array]) { throw 'Existing catalog cannot be used as template' }
     }
-    [IO.File]::WriteAllText($templatePath, $template + "`n", $utf8)
-} else {
-    $value = [IO.File]::ReadAllText($templatePath) | ConvertFrom-Json
-    if ($value.models -isnot [array]) { throw 'Invalid existing model template' }
+}
+$value = $template | ConvertFrom-Json
+if ($value.models -isnot [array]) { throw 'Invalid existing model template' }
+$profiles = New-Object 'System.Collections.Generic.List[object]'
+foreach ($profile in $value.models) {
+    if (-not ($profile.slug -is [string]) -or -not $profile.slug) { throw 'Invalid template model' }
+    $profiles.Add($profile)
+}
+foreach ($managed in $bundled.models) {
+    $existing = @($profiles | Where-Object { $_.slug -ceq $managed.slug })
+    if ($existing.Count -eq 0) {
+        $profiles.Add($managed)
+        continue
+    }
+    foreach ($profile in $existing) {
+        $profile | Add-Member -NotePropertyName default_reasoning_level -NotePropertyValue $managed.default_reasoning_level -Force
+        $profile | Add-Member -NotePropertyName supported_reasoning_levels -NotePropertyValue $managed.supported_reasoning_levels -Force
+    }
+}
+$value.models = $profiles.ToArray()
+$updatedTemplate = ($value | ConvertTo-Json -Depth 100) + "`n"
+if (-not (Test-Path -LiteralPath $templatePath) -or $updatedTemplate -ne [IO.File]::ReadAllText($templatePath)) {
+    $temporaryTemplate = Join-Path (Split-Path $templatePath) ('.template-' + [guid]::NewGuid().ToString('N'))
+    $templateBackup = Join-Path (Split-Path $templatePath) ('.template-replaced-' + [guid]::NewGuid().ToString('N'))
+    $templateReplaced = $false
+    try {
+        [IO.File]::WriteAllText($temporaryTemplate, $updatedTemplate, $utf8)
+        if (Test-Path -LiteralPath $templatePath) {
+            [IO.File]::Replace($temporaryTemplate, $templatePath, $templateBackup)
+            $templateReplaced = $true
+        } else {
+            [IO.File]::Move($temporaryTemplate, $templatePath)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $temporaryTemplate) { Remove-Item -LiteralPath $temporaryTemplate -Force }
+        if ($templateReplaced -and (Test-Path -LiteralPath $templateBackup)) {
+            Remove-Item -LiteralPath $templateBackup -Force
+        }
+    }
 }
 if (-not (Test-Path -LiteralPath $catalogPath)) {
     [IO.File]::WriteAllText($catalogPath, "{`"models`":[]}`n", $utf8)

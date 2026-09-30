@@ -2,6 +2,7 @@ import copy
 import http.server
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -12,7 +13,7 @@ import unittest
 from unittest.mock import patch
 import urllib.error
 
-from codex_model_sync import SYNC_INTERVAL, build_catalog, sync_delay, sync_once
+from codex_model_sync import REASONING_TEMPLATE, SYNC_INTERVAL, build_catalog, sync_delay, sync_once
 from configure_codex_sync import configure
 
 
@@ -151,42 +152,71 @@ class ModelSyncTests(unittest.TestCase):
         )
         self.assertEqual(unknown["supported_reasoning_levels"], [])
 
-    def test_gpt_family_efforts_fill_new_versions_without_overriding_template(self):
-        models = ["gpt-5.5", "gpt-5.6", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
-                  "gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol",
-                  "gpt-6.2-sol", "gpt-6.1-astra", "gpt-6.1-image", "gpt-reserve"]
-        sol_levels = [{"effort": effort, "description": f"Custom {effort}"}
-                      for effort in ("low", "medium", "high", "xhigh", "max", "ultra")]
+    def test_managed_reasoning_repairs_stale_templates_and_preserves_metadata(self):
+        names = [model["slug"] for model in REASONING_TEMPLATE["models"]]
+        stale = {"models": [{
+            "slug": name,
+            "context_window": 123456,
+            "base_instructions": "Existing instructions",
+            "custom": {"value": 1},
+            "default_reasoning_level": "none",
+            "supported_reasoning_levels": [{"effort": "xhigh", "description": "Stale"}],
+        } for name in names]}
+        original = copy.deepcopy(stale)
+        fresh = {model["slug"]: model for model in build_catalog(names, {"models": []})["models"]}
+        repaired = {model["slug"]: model for model in build_catalog(names, stale)["models"]}
+        for managed in REASONING_TEMPLATE["models"]:
+            with self.subTest(name=managed["slug"]):
+                name = managed["slug"]
+                self.assertEqual(repaired[name]["supported_reasoning_levels"], managed["supported_reasoning_levels"])
+                self.assertEqual(repaired[name]["default_reasoning_level"], managed["default_reasoning_level"])
+                self.assertEqual(fresh[name]["supported_reasoning_levels"], repaired[name]["supported_reasoning_levels"])
+                self.assertEqual(repaired[name]["context_window"], 123456)
+                self.assertEqual(repaired[name]["base_instructions"], "Existing instructions")
+                self.assertEqual(repaired[name]["custom"], {"value": 1})
+        self.assertEqual(stale, original)
+        for name in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"):
+            self.assertIn("ultra", [level["effort"] for level in repaired[name]["supported_reasoning_levels"]])
+        for name in ("gpt-5.6-luna", "gpt-6-luna"):
+            self.assertNotIn("ultra", [level["effort"] for level in repaired[name]["supported_reasoning_levels"]])
+        for name in ("step-3.7-flash", "step-5-preview"):
+            self.assertEqual([level["effort"] for level in repaired[name]["supported_reasoning_levels"]],
+                             ["low", "medium", "high"])
+
+    def test_new_versions_inherit_the_latest_repaired_family_profile(self):
         template = {"models": [
-            {"slug": "gpt-6-astra", "default_reasoning_level": "none",
-             "supported_reasoning_levels": []},
-            {"slug": "gpt-6-sol", "default_reasoning_level": "low",
-             "supported_reasoning_levels": sol_levels},
+            {"slug": "gpt-6-sol", "default_reasoning_level": "none",
+             "supported_reasoning_levels": [{"effort": "high", "description": "Stale"}]},
             {"slug": "gpt-5.6", "default_reasoning_level": "none",
              "supported_reasoning_levels": [{"effort": "high", "description": "Custom"}]},
-            {"slug": "gpt-reserve", "default_reasoning_level": "high",
+            {"slug": "unknown", "default_reasoning_level": "high",
              "supported_reasoning_levels": [{"effort": "high", "description": "Custom"}]},
         ]}
-        catalog = {model["slug"]: model for model in build_catalog(models, template)["models"]}
-        self.assertEqual([level["effort"] for level in catalog["gpt-5.5"]["supported_reasoning_levels"]],
-                         ["none", "low", "medium", "high", "xhigh"])
-        for name in ("gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-luna"):
+        names = ["gpt-6.2-sol", "gpt-6.1-astra", "gpt-7-sol", "gpt-5.6", "unknown", "gpt-6.1-image"]
+        catalog = {model["slug"]: model for model in build_catalog(names, template)["models"]}
+        for name in ("gpt-6.2-sol", "gpt-6.1-astra", "gpt-7-sol"):
             self.assertEqual([level["effort"] for level in catalog[name]["supported_reasoning_levels"]],
-                             ["none", "low", "medium", "high", "xhigh", "max"])
-        for name in ("gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol"):
-            self.assertEqual(catalog[name]["supported_reasoning_levels"], sol_levels)
-            self.assertEqual(catalog[name]["default_reasoning_level"], "low")
-        self.assertEqual([level["effort"] for level in catalog["gpt-6-astra"]["supported_reasoning_levels"]],
-                         ["low", "medium", "high", "xhigh", "max"])
-        self.assertEqual([level["effort"] for level in catalog["gpt-6.1-astra"]["supported_reasoning_levels"]],
-                         ["low", "medium", "high", "xhigh", "max"])
-        self.assertEqual(catalog["gpt-6-astra"]["default_reasoning_level"], "medium")
-        self.assertEqual([level["effort"] for level in catalog["gpt-5.6"]["supported_reasoning_levels"]],
-                         ["high"])
+                             ["low", "medium", "high", "xhigh", "max", "ultra"])
+        self.assertEqual(catalog["gpt-6.2-sol"]["default_reasoning_level"], "medium")
+        self.assertEqual(catalog["gpt-6.1-astra"]["default_reasoning_level"], "low")
         self.assertEqual(catalog["gpt-5.6"]["default_reasoning_level"], "high")
-        self.assertEqual(catalog["gpt-reserve"]["supported_reasoning_levels"],
-                         [{"effort": "high", "description": "Custom"}])
+        for name in ("gpt-5.6", "unknown"):
+            self.assertEqual(catalog[name]["supported_reasoning_levels"],
+                             [{"effort": "high", "description": "Custom"}])
         self.assertEqual(catalog["gpt-6.1-image"]["supported_reasoning_levels"], [])
+
+    def test_missing_template_preserves_metadata_from_the_previous_catalog(self):
+        self.server.payload = {"data": [{"id": "gpt-6-sol"}, {"id": "unknown"}]}
+        self.output.parent.mkdir(parents=True)
+        self.output.write_text(json.dumps({"models": [{
+            "slug": "gpt-6-sol", "context_window": 123456,
+            "default_reasoning_level": "none", "supported_reasoning_levels": [],
+        }]}))
+        sync_once(self.base_url, self.key, self.output, self.root / "missing-template.json")
+        models = json.loads(self.output.read_text())["models"]
+        self.assertEqual(models[0]["context_window"], 123456)
+        self.assertIn("ultra", [level["effort"] for level in models[0]["supported_reasoning_levels"]])
+        self.assertEqual(models[1]["supported_reasoning_levels"], [])
 
     def test_failure_preserves_catalog_and_success_timestamp(self):
         sync_once(self.base_url, self.key, self.output)
@@ -244,7 +274,7 @@ class ManualSyncCommandTests(unittest.TestCase):
         source = Path(__file__).resolve().parent
         for name in ("sync-codex-models.sh", "restart-codex-app-server.sh",
                      "start-codex-with-new-api-key.sh", "configure_codex_sync.py",
-                     "codex_model_sync.py"):
+                     "codex_model_sync.py", "codex-model-template.json"):
             target = bin_dir / name
             target.write_bytes((source / name).read_bytes())
             if name.endswith(".sh"):
@@ -428,7 +458,7 @@ class ManualSyncCommandTests(unittest.TestCase):
 
 
 class CodexConfigurationTests(unittest.TestCase):
-    def test_fresh_install_generates_empty_template_and_config(self):
+    def test_fresh_install_generates_shared_reasoning_template_and_config(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             key = root / ".codex-sync/config/api-key"
@@ -436,8 +466,8 @@ class CodexConfigurationTests(unittest.TestCase):
             key.write_text("test-gateway-token\n")
             codex_home = root / "home"
             catalog = configure(root, codex_home, "http://127.0.0.1:9000/v1")
-            self.assertEqual(json.loads((root / ".codex-sync/config/template.json").read_text()),
-                             {"models": []})
+            self.assertEqual(json.loads((root / ".codex-sync/config/template.json").read_text())["models"],
+                             REASONING_TEMPLATE["models"])
             self.assertEqual(catalog, root / ".codex-sync/catalog/models.json")
             self.assertIn('model_provider = "new_api_sync"',
                           (codex_home / "config.toml").read_text())
@@ -472,6 +502,40 @@ class CodexConfigurationTests(unittest.TestCase):
             self.assertEqual(config.read_text(), first)
             self.assertEqual(json.loads(template.read_text())["models"][0]["context_window"], 12345)
 
+    def test_reconfiguration_repairs_existing_template_without_touching_key_or_auth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = root / ".codex-sync/config/api-key"
+            key.parent.mkdir(parents=True)
+            key.write_text("test-gateway-token\n")
+            template = key.with_name("template.json")
+            template.write_text(json.dumps({"models": [{
+                "slug": "gpt-6-sol", "context_window": 123456,
+                "default_reasoning_level": "none", "supported_reasoning_levels": [],
+            }, {
+                "slug": "step-5-preview", "default_reasoning_level": "xhigh",
+                "supported_reasoning_levels": [{"effort": "xhigh", "description": "Stale"}],
+            }]}))
+            codex_home = root / "home"
+            configure(root, codex_home, "http://127.0.0.1:9000/v1")
+            models = {model["slug"]: model for model in json.loads(template.read_text())["models"]}
+            self.assertEqual(models["gpt-6-sol"]["context_window"], 123456)
+            self.assertIn("ultra", [level["effort"] for level in models["gpt-6-sol"]["supported_reasoning_levels"]])
+            self.assertEqual([level["effort"] for level in models["step-5-preview"]["supported_reasoning_levels"]],
+                             ["low", "medium", "high"])
+            self.assertEqual(models["step-5-preview"]["default_reasoning_level"], "medium")
+            config = codex_home / "config.toml"
+            previous_config, previous_template = config.read_bytes(), template.read_bytes()
+            key_before = key.read_bytes()
+            configure(root, codex_home, "http://127.0.0.1:9000/v1")
+            self.assertEqual(key.read_bytes(), key_before)
+            self.assertEqual(config.read_bytes(), previous_config)
+            self.assertEqual(template.read_bytes(), previous_template)
+            provider = tomllib.loads(config.read_text())["model_providers"]["new_api_sync"]
+            self.assertEqual(provider["env_key"], "NEW_API_KEY")
+            self.assertEqual(provider["wire_api"], "responses")
+            self.assertNotIn("test-gateway-token", config.read_text() + template.read_text())
+
     def test_missing_key_leaves_codex_configuration_untouched(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -500,7 +564,7 @@ class DockerDeploymentTests(unittest.TestCase):
         bin_dir.mkdir()
         source = Path(__file__).resolve().parent
         for name in ("deploy-codex-sync.sh", "sync-codex-models.sh",
-                     "configure_codex_sync.py", "codex_model_sync.py"):
+                     "configure_codex_sync.py", "codex_model_sync.py", "codex-model-template.json"):
             (bin_dir / name).write_bytes((source / name).read_bytes())
             if name.endswith(".sh"):
                 (bin_dir / name).chmod(0o700)
@@ -589,7 +653,10 @@ class DockerDeploymentTests(unittest.TestCase):
         self.assertEqual(len(self.calls.read_text().splitlines()), 6)
 
 
-@unittest.skipUnless(os.name == "nt", "Windows PowerShell deployment")
+POWERSHELL = shutil.which("powershell.exe") or shutil.which("pwsh")
+
+
+@unittest.skipUnless(POWERSHELL, "PowerShell is not installed")
 class WindowsExeDeploymentTests(unittest.TestCase):
     def test_codex_provider_reads_gateway_key_without_process_environment(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -597,7 +664,7 @@ class WindowsExeDeploymentTests(unittest.TestCase):
             bin_dir = root / "bin"
             bin_dir.mkdir()
             source = Path(__file__).resolve().parent
-            for name in ("configure-codex-sync.ps1", "read-codex-api-key.ps1"):
+            for name in ("configure-codex-sync.ps1", "read-codex-api-key.ps1", "codex-model-template.json"):
                 (bin_dir / name).write_bytes((source / name).read_bytes())
             key = root / ".codex-sync/config/api-key"
             key.parent.mkdir(parents=True)
@@ -617,10 +684,18 @@ class WindowsExeDeploymentTests(unittest.TestCase):
                 'wire_api = "responses"\n'
                 '# END new-api model sync provider\n'
             )
+            template = key.with_name("template.json")
+            template.write_text(json.dumps({"models": [{
+                "slug": "gpt-6-sol", "context_window": 123456,
+                "default_reasoning_level": "none", "supported_reasoning_levels": [],
+            }, {
+                "slug": "step-5-preview", "default_reasoning_level": "xhigh",
+                "supported_reasoning_levels": [{"effort": "xhigh", "description": "Stale"}],
+            }]}))
             environment = {**os.environ, "CODEX_HOME": str(codex_home)}
             environment.pop("NEW_API_KEY", None)
             configured = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass",
                  "-File", str(bin_dir / "configure-codex-sync.ps1"), "-Port", "9900"],
                 env=environment, text=True, capture_output=True, timeout=20,
             )
@@ -635,8 +710,19 @@ class WindowsExeDeploymentTests(unittest.TestCase):
             self.assertEqual(provider["auth"]["args"][-1], str(bin_dir / "read-codex-api-key.ps1"))
             self.assertNotIn("test-gateway-token", config_text)
             self.assertTrue(Path(config["model_catalog_json"]).is_file())
+            repaired = {model["slug"]: model for model in json.loads(template.read_text())["models"]}
+            self.assertEqual(repaired["gpt-6-sol"]["context_window"], 123456)
+            for managed in REASONING_TEMPLATE["models"]:
+                self.assertEqual(repaired[managed["slug"]]["supported_reasoning_levels"], managed["supported_reasoning_levels"])
+                self.assertEqual(repaired[managed["slug"]]["default_reasoning_level"], managed["default_reasoning_level"])
+            first_template, first_config = template.read_bytes(), (codex_home / "config.toml").read_bytes()
+            again = subprocess.run(configured.args, env=environment, text=True, capture_output=True, timeout=20)
+            self.assertEqual(again.returncode, 0, again.stderr)
+            self.assertEqual(template.read_bytes(), first_template)
+            self.assertEqual((codex_home / "config.toml").read_bytes(), first_config)
+            self.assertEqual(key.read_text(), "test-gateway-token\n")
 
-            reader = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            reader = [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass",
                       "-File", str(bin_dir / "read-codex-api-key.ps1")]
             read = subprocess.run(reader, env=environment, text=True, capture_output=True, timeout=20)
             self.assertEqual(read.returncode, 0, read.stderr)
@@ -645,6 +731,31 @@ class WindowsExeDeploymentTests(unittest.TestCase):
             rejected = subprocess.run(reader, env=environment, text=True, capture_output=True, timeout=20)
             self.assertNotEqual(rejected.returncode, 0)
             self.assertNotIn("test-gateway-token", rejected.stdout + rejected.stderr)
+
+    def test_prepare_only_writes_shared_template_but_preserves_codex_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            for name in ("configure-codex-sync.ps1", "codex-model-template.json"):
+                (bin_dir / name).write_bytes(Path(__file__).with_name(name).read_bytes())
+            codex_home = root / "home"
+            codex_home.mkdir()
+            config = codex_home / "config.toml"
+            original = 'model_provider = "existing"\nmodel = "existing-model"\n'
+            config.write_text(original)
+            environment = {**os.environ, "CODEX_HOME": str(codex_home)}
+            result = subprocess.run(
+                [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                 str(bin_dir / "configure-codex-sync.ps1"), "-Port", "9900", "-PrepareOnly"],
+                env=environment, text=True, capture_output=True, timeout=20,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(config.read_text(), original)
+            template = json.loads((root / ".codex-sync/config/template.json").read_text())
+            self.assertEqual(template["models"], REASONING_TEMPLATE["models"])
+            self.assertFalse((root / ".codex-sync/config/api-key").exists())
+            self.assertFalse((root / ".codex-sync/config/auto-sync-enabled").exists())
 
     def test_first_deploy_bootstraps_placeholder_without_requiring_a_token(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -660,7 +771,7 @@ class WindowsExeDeploymentTests(unittest.TestCase):
                 "function go { $global:LASTEXITCODE = 0 }; "
                 f"& '{str(script).replace(chr(39), chr(39) * 2)}' -NoStart -Port 9901"
             )
-            args = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            args = [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass",
                     "-Command", command]
             first = subprocess.run(args, env=environment, text=True,
                                    capture_output=True, timeout=20)
@@ -694,7 +805,7 @@ class WindowsExeDeploymentTests(unittest.TestCase):
             launcher = root / "bin/start-codex-with-new-api-key.ps1"
             launcher.write_bytes(Path(__file__).resolve().with_name(launcher.name).read_bytes())
             rejected = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass",
                  "-File", str(launcher)],
                 env=environment, text=True, capture_output=True, timeout=20,
             )

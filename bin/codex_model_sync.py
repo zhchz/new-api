@@ -14,16 +14,11 @@ import urllib.parse
 import urllib.request
 
 
-STANDARD_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
+# Shared with the Windows executable (go:embed) and both configurators.
+REASONING_TEMPLATE = json.loads(
+    Path(__file__).with_name("codex-model-template.json").read_text(encoding="utf-8")
+)
 GPT_MODEL_PATTERN = re.compile(r"gpt-(\d+)(?:\.(\d+))?(?:-(luna|sol|terra|astra))?")
-REASONING_EFFORT_DESCRIPTIONS = {
-    "none": "No reasoning",
-    "low": "Faster responses with lighter reasoning",
-    "medium": "Balanced reasoning for everyday tasks",
-    "high": "Deeper reasoning for complex tasks",
-    "xhigh": "Extended reasoning for difficult tasks",
-    "max": "Maximum reasoning for the hardest tasks",
-}
 SYNC_INTERVAL = 4 * 60 * 60
 KEY_PLACEHOLDER = "REPLACE_WITH_NEW_API_KEY"
 
@@ -44,16 +39,18 @@ def reasoning_model_parts(name):
     return None
 
 
-def known_reasoning_efforts(parts):
-    """Provide defaults when no exact or earlier same-family catalog entry exists."""
-    major, minor, family = parts
-    if major == 5 and minor == 5:
-        return STANDARD_REASONING_EFFORTS[:-1]
-    if major == 5:
-        return STANDARD_REASONING_EFFORTS
-    if family == "astra":
-        return STANDARD_REASONING_EFFORTS[1:]
-    return STANDARD_REASONING_EFFORTS
+def merge_reasoning_template(template):
+    """Repair managed reasoning fields without replacing other model metadata."""
+    if not isinstance(template, dict) or not isinstance(template.get("models"), list):
+        raise ValueError("invalid template catalog")
+    profiles = {}
+    for profile in template["models"]:
+        if not isinstance(profile, dict) or not isinstance(profile.get("slug"), str) or not profile["slug"]:
+            raise ValueError("invalid template model")
+        profiles[profile["slug"]] = copy.deepcopy(profile)
+    for managed in REASONING_TEMPLATE["models"]:
+        profiles.setdefault(managed["slug"], {}).update(copy.deepcopy(managed))
+    return {**template, "models": list(profiles.values())}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -117,42 +114,28 @@ def fetch_models(base_url, api_key_file):
 
 
 def build_catalog(names, template):
-    if not isinstance(template, dict) or not isinstance(template.get("models"), list):
-        raise ValueError("invalid template catalog")
-    profiles = {}
-    for profile in template["models"]:
-        if not isinstance(profile, dict) or not isinstance(profile.get("slug"), str):
-            raise ValueError("invalid template model")
-        profiles[profile["slug"]] = profile
+    template = merge_reasoning_template(template)
+    profiles = {profile["slug"]: profile for profile in template["models"]}
     models = []
     for priority, name in enumerate(sorted(set(names))):
-        profile = copy.deepcopy(profiles.get(name))
-        if profile is None:
-            profile = {
-                "slug": name,
-                "display_name": name,
-                "description": "Model available through New API",
-                "default_reasoning_level": None,
-                "supported_reasoning_levels": [],
-                "shell_type": "unified_exec",
-                "base_instructions": "You are a coding assistant. Follow the user's instructions and the project's conventions.",
-                "supports_reasoning_summaries": False,
-                "support_verbosity": False,
-                "supports_parallel_tool_calls": False,
-                "input_modalities": ["text"],
-                "truncation_policy": {"mode": "tokens", "limit": 10000},
-                "experimental_supported_tools": [],
-            }
-            if name == "step-5-preview":
-                profile["default_reasoning_level"] = "medium"
-                profile["supported_reasoning_levels"] = [
-                    {"effort": "low", "description": "Faster responses with lighter reasoning"},
-                    {"effort": "medium", "description": "Balanced reasoning for everyday tasks"},
-                    {"effort": "high", "description": "Deeper reasoning for complex tasks"},
-                ]
+        profile = {
+            "slug": name,
+            "display_name": name,
+            "description": "Model available through New API",
+            "default_reasoning_level": None,
+            "supported_reasoning_levels": [],
+            "shell_type": "unified_exec",
+            "base_instructions": "You are a coding assistant. Follow the user's instructions and the project's conventions.",
+            "supports_reasoning_summaries": False,
+            "support_verbosity": False,
+            "supports_parallel_tool_calls": False,
+            "input_modalities": ["text"],
+            "truncation_policy": {"mode": "tokens", "limit": 10000},
+            "experimental_supported_tools": [],
+        }
+        profile.update(copy.deepcopy(profiles.get(name, {})))
         model_parts = reasoning_model_parts(name)
         if model_parts is not None:
-            known_efforts = known_reasoning_efforts(model_parts)
             if not profile.get("supported_reasoning_levels"):
                 major, minor, family = model_parts
                 previous = None
@@ -170,11 +153,17 @@ def build_catalog(names, template):
                     if profile.get("default_reasoning_level") is None:
                         profile["default_reasoning_level"] = previous.get("default_reasoning_level")
                 else:
-                    profile["supported_reasoning_levels"] = [
-                        {"effort": effort, "description": REASONING_EFFORT_DESCRIPTIONS[effort]}
-                        for effort in known_efforts
-                    ]
-            available = [level["effort"] for level in profile["supported_reasoning_levels"]]
+                    fallback = profiles[REASONING_TEMPLATE["reasoning_family_defaults"][family or "standard"]]
+                    profile["supported_reasoning_levels"] = copy.deepcopy(fallback["supported_reasoning_levels"])
+                    if profile.get("default_reasoning_level") is None:
+                        profile["default_reasoning_level"] = fallback["default_reasoning_level"]
+            levels = profile["supported_reasoning_levels"]
+            if not isinstance(levels, list) or any(
+                not isinstance(level, dict) or not isinstance(level.get("effort"), str) or not level["effort"]
+                for level in levels
+            ):
+                raise ValueError("invalid catalog reasoning level")
+            available = [level["effort"] for level in levels]
             if profile.get("default_reasoning_level") not in available:
                 profile["default_reasoning_level"] = "medium" if "medium" in available else available[0]
         profile.update(visibility="list", supported_in_api=True, priority=priority)
@@ -185,11 +174,14 @@ def build_catalog(names, template):
 def sync_once(base_url, api_key_file, output, template_file=None):
     names = fetch_models(base_url, api_key_file)
     template = {"models": []}
-    if template_file is not None:
+    sources = [Path(template_file)] if template_file is not None else []
+    sources.append(Path(output))
+    for source in sources:
         try:
-            template = json.loads(Path(template_file).read_text())
+            template = json.loads(source.read_text(encoding="utf-8-sig"))
+            break
         except FileNotFoundError:
-            pass
+            continue
     catalog = build_catalog(names, template)
     encoded = (json.dumps(catalog, ensure_ascii=False, indent=2) + "\n").encode()
     output = Path(output)

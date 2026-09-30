@@ -89,6 +89,7 @@ services:
       - "14400"
     volumes:
       - ./bin/codex_model_sync.py:/app/codex_model_sync.py:ro
+      - ./bin/codex-model-template.json:/app/codex-model-template.json:ro
       - ./.codex-sync/config:/config:ro
       - ./.codex-sync/catalog:/catalog
     depends_on:

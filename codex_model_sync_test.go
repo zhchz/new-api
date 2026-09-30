@@ -5,7 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"sync"
 	"testing"
@@ -130,14 +132,14 @@ func TestCodexModelSyncDelay(t *testing.T) {
 
 func TestSyncCodexModelCatalogAddsReasoningEffortsForNewFamilyVersions(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"data":[{"id":"gpt-5.5"},{"id":"gpt-5.6"},{"id":"gpt-5.6-luna"},{"id":"gpt-6-astra"},{"id":"gpt-6-sol"},{"id":"gpt-6.1-sol"},{"id":"gpt-6.2-sol"},{"id":"gpt-6.1-astra"},{"id":"gpt-6.1-image"},{"id":"gpt-reserve"}]}`))
+		_, _ = w.Write([]byte(`{"data":[{"id":"gpt-5.5"},{"id":"gpt-5.6"},{"id":"gpt-5.6-luna"},{"id":"gpt-6-astra"},{"id":"gpt-6-sol"},{"id":"gpt-6.1-sol"},{"id":"gpt-6.2-sol"},{"id":"gpt-6.1-astra"},{"id":"gpt-6.1-image"},{"id":"model-custom"}]}`))
 	}))
 	defer server.Close()
 	root := t.TempDir()
 	keyPath := filepath.Join(root, "api-key")
 	outputPath := filepath.Join(root, "models.json")
 	require.NoError(t, os.WriteFile(keyPath, []byte("test-gateway-token\n"), 0600))
-	require.NoError(t, os.WriteFile(outputPath, []byte(`{"models":[{"slug":"gpt-6-astra","default_reasoning_level":"none","supported_reasoning_levels":[]},{"slug":"gpt-6-sol","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low","description":"Custom low"},{"effort":"medium","description":"Custom medium"},{"effort":"high","description":"Custom high"},{"effort":"xhigh","description":"Custom xhigh"},{"effort":"max","description":"Custom max"},{"effort":"ultra","description":"Custom ultra"}]},{"slug":"gpt-5.6","default_reasoning_level":"none","supported_reasoning_levels":[{"effort":"high","description":"Custom"}]},{"slug":"gpt-reserve","default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"high","description":"Custom"}]}]}`), 0600))
+	require.NoError(t, os.WriteFile(outputPath, []byte(`{"models":[{"slug":"gpt-6-astra","default_reasoning_level":"none","supported_reasoning_levels":[]},{"slug":"gpt-6-sol","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low","description":"Custom low"},{"effort":"medium","description":"Custom medium"},{"effort":"high","description":"Custom high"},{"effort":"xhigh","description":"Custom xhigh"},{"effort":"max","description":"Custom max"},{"effort":"ultra","description":"Custom ultra"}]},{"slug":"gpt-5.6","default_reasoning_level":"none","supported_reasoning_levels":[{"effort":"high","description":"Custom"}]},{"slug":"model-custom","default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"high","description":"Custom"}]}]}`), 0600))
 	count, changed, err := syncCodexModelCatalog(context.Background(), server.Client(), server.URL+"/v1", keyPath, filepath.Join(root, "missing-template.json"), outputPath)
 	require.NoError(t, err)
 	assert.True(t, changed)
@@ -156,16 +158,16 @@ func TestSyncCodexModelCatalogAddsReasoningEffortsForNewFamilyVersions(t *testin
 		name    string
 		efforts []string
 	}{
-		{"gpt-5.5", []string{"none", "low", "medium", "high", "xhigh"}},
+		{"gpt-5.5", []string{"low", "medium", "high", "xhigh"}},
 		{"gpt-5.6", []string{"high"}},
-		{"gpt-5.6-luna", []string{"none", "low", "medium", "high", "xhigh", "max"}},
-		{"gpt-6-astra", []string{"low", "medium", "high", "xhigh", "max"}},
+		{"gpt-5.6-luna", []string{"low", "medium", "high", "xhigh", "max"}},
+		{"gpt-6-astra", []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
 		{"gpt-6-sol", []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
 		{"gpt-6.1-sol", []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
 		{"gpt-6.2-sol", []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
-		{"gpt-6.1-astra", []string{"low", "medium", "high", "xhigh", "max"}},
+		{"gpt-6.1-astra", []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
 		{"gpt-6.1-image", []string{}},
-		{"gpt-reserve", []string{"high"}},
+		{"model-custom", []string{"high"}},
 	}
 	for _, test := range cases {
 		efforts := []string{}
@@ -174,11 +176,11 @@ func TestSyncCodexModelCatalogAddsReasoningEffortsForNewFamilyVersions(t *testin
 		}
 		assert.Equal(t, test.efforts, efforts, test.name)
 	}
-	assert.Equal(t, "medium", byName["gpt-6-astra"]["default_reasoning_level"])
-	assert.Equal(t, "low", byName["gpt-6.1-sol"]["default_reasoning_level"])
-	assert.Equal(t, "Custom ultra", byName["gpt-6.1-sol"]["supported_reasoning_levels"].([]any)[5].(map[string]any)["description"])
+	assert.Equal(t, "low", byName["gpt-6-astra"]["default_reasoning_level"])
+	assert.Equal(t, "medium", byName["gpt-6.1-sol"]["default_reasoning_level"])
+	assert.Equal(t, "Ultra reasoning for the most demanding tasks", byName["gpt-6.1-sol"]["supported_reasoning_levels"].([]any)[5].(map[string]any)["description"])
 	assert.Equal(t, "high", byName["gpt-5.6"]["default_reasoning_level"])
-	assert.Equal(t, "high", byName["gpt-reserve"]["default_reasoning_level"])
+	assert.Equal(t, "high", byName["model-custom"]["default_reasoning_level"])
 }
 
 func TestSyncCodexModelCatalogRejectsInvalidResponse(t *testing.T) {
@@ -196,4 +198,89 @@ func TestSyncCodexModelCatalogRejectsInvalidResponse(t *testing.T) {
 	unchanged, err := os.ReadFile(outputPath)
 	require.NoError(t, err)
 	assert.Equal(t, `{"models":[]}`, string(unchanged))
+}
+
+func TestCodexModelCatalogMatchesPythonForFreshAndStaleTemplates(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("Python 3 is required for cross-platform catalog verification")
+	}
+	var bundled struct {
+		Models []map[string]any `json:"models"`
+	}
+	require.NoError(t, common.Unmarshal(codexReasoningTemplate, &bundled))
+	names := make([]string, 0, len(bundled.Models)+3)
+	entries := make([]map[string]any, 0, len(bundled.Models)+3)
+	staleModels := make([]map[string]any, 0, len(bundled.Models)+1)
+	for _, profile := range bundled.Models {
+		name := profile["slug"].(string)
+		names = append(names, name)
+		entries = append(entries, map[string]any{"id": name})
+		staleModels = append(staleModels, map[string]any{
+			"slug":                       name,
+			"context_window":             123456,
+			"base_instructions":          "Existing instructions",
+			"default_reasoning_level":    "none",
+			"supported_reasoning_levels": []map[string]string{{"effort": "xhigh", "description": "Stale"}},
+		})
+	}
+	for _, name := range []string{"gpt-6.2-sol", "gpt-6.1-astra", "model-custom"} {
+		names = append(names, name)
+		entries = append(entries, map[string]any{"id": name})
+	}
+	staleModels = append(staleModels, map[string]any{
+		"slug":                       "model-custom",
+		"default_reasoning_level":    "high",
+		"supported_reasoning_levels": []map[string]string{{"effort": "high", "description": "Custom"}},
+	})
+	payload, err := common.Marshal(map[string]any{"data": entries})
+	require.NoError(t, err)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "Bearer test-gateway-token", r.Header.Get("Authorization"))
+		_, _ = w.Write(payload)
+	}))
+	defer server.Close()
+	workingDirectory, err := os.Getwd()
+	require.NoError(t, err)
+	for _, source := range []string{"fresh", "stale", "previous-catalog"} {
+		t.Run(source, func(t *testing.T) {
+			root := t.TempDir()
+			keyPath := filepath.Join(root, "api-key")
+			templatePath := filepath.Join(root, "template.json")
+			outputPath := filepath.Join(root, "models.json")
+			require.NoError(t, os.WriteFile(keyPath, []byte("test-gateway-token\n"), 0600))
+			template := map[string]any{"models": []map[string]any{}}
+			if source != "fresh" {
+				template["models"] = staleModels
+			}
+			encodedTemplate, err := common.Marshal(template)
+			require.NoError(t, err)
+			target := templatePath
+			if source == "previous-catalog" {
+				target = outputPath
+			}
+			require.NoError(t, os.WriteFile(target, encodedTemplate, 0600))
+			count, changed, err := syncCodexModelCatalog(context.Background(), server.Client(), server.URL+"/v1", keyPath, templatePath, outputPath)
+			require.NoError(t, err)
+			assert.True(t, changed)
+			assert.Equal(t, len(names), count)
+			actual, err := os.ReadFile(outputPath)
+			require.NoError(t, err)
+			input, err := common.Marshal(map[string]any{"names": names, "template": template})
+			require.NoError(t, err)
+			command := exec.Command(python, "-B", "-c", `import json, sys
+from codex_model_sync import build_catalog
+request = json.load(sys.stdin)
+print(json.dumps(build_catalog(request["names"], request["template"])))`)
+			command.Dir = filepath.Join(workingDirectory, "bin")
+			command.Stdin = strings.NewReader(string(input))
+			expected, err := command.CombinedOutput()
+			require.NoError(t, err, string(expected))
+			assert.JSONEq(t, string(expected), string(actual))
+			keyAfter, err := os.ReadFile(keyPath)
+			require.NoError(t, err)
+			assert.Equal(t, "test-gateway-token\n", string(keyAfter))
+			assert.NotContains(t, string(actual), "test-gateway-token")
+		})
+	}
 }

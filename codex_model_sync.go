@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"errors"
 	"fmt"
 	"io"
@@ -30,6 +31,9 @@ var errCodexGatewayModelsPending = errors.New("gateway has no usable models for 
 var errCodexGatewayUnauthorized = errors.New("gateway key is not authorized")
 
 const codexModelSyncEnabledFile = "auto-sync-enabled"
+
+//go:embed bin/codex-model-template.json
+var codexReasoningTemplate []byte
 
 var codexKnownGPTModelPattern = regexp.MustCompile(`^gpt-(\d+)(?:\.(\d+))?(?:-(luna|sol|terra|astra))?$`)
 
@@ -262,24 +266,6 @@ func codexReasoningModelParts(name string) (major, minor int, family string, kno
 	return major, minor, family, known
 }
 
-// codexKnownReasoningEfforts supplies defaults when the catalog has no exact
-// or earlier same-family reasoning configuration.
-func codexKnownReasoningEfforts(major, minor int, family string) []string {
-	standard := []string{"none", "low", "medium", "high", "xhigh", "max"}
-	switch {
-	case major == 5 && minor == 5 && family == "":
-		return standard[:len(standard)-1]
-	case major == 5 && minor >= 6 && family != "astra":
-		return standard
-	case major >= 6 && family == "astra":
-		return standard[1:]
-	case major >= 6:
-		return standard
-	default:
-		return nil
-	}
-}
-
 func syncCodexModelCatalog(ctx context.Context, client *http.Client, baseURL, keyPath, templatePath, outputPath string) (int, bool, error) {
 	modelNames, err := fetchCodexGatewayModelNames(ctx, client, baseURL, keyPath)
 	if err != nil {
@@ -315,42 +301,42 @@ func syncCodexModelCatalog(ctx context.Context, client *http.Client, baseURL, ke
 			profiles[name] = profile
 		}
 	}
+	// Managed reasoning fields always win over stale machine-local catalogs.
+	// Other metadata and unknown models remain untouched.
+	var managed struct {
+		Models                  []map[string]any  `json:"models"`
+		ReasoningFamilyDefaults map[string]string `json:"reasoning_family_defaults"`
+	}
+	if err := common.Unmarshal(codexReasoningTemplate, &managed); err != nil {
+		return 0, false, errors.New("invalid bundled catalog template")
+	}
+	for _, definition := range managed.Models {
+		name := definition["slug"].(string)
+		profile := make(map[string]any)
+		maps.Copy(profile, profiles[name])
+		maps.Copy(profile, definition)
+		profiles[name] = profile
+	}
 	models := make([]map[string]any, 0, len(modelNames))
 	for priority, name := range modelNames {
-		profile := profiles[name]
-		if profile != nil {
-			copy := make(map[string]any, len(profile))
-			maps.Copy(copy, profile)
-			profile = copy
+		profile := map[string]any{
+			"slug":                         name,
+			"display_name":                 name,
+			"description":                  "Model available through New API",
+			"default_reasoning_level":      nil,
+			"supported_reasoning_levels":   []any{},
+			"shell_type":                   "unified_exec",
+			"base_instructions":            "You are a coding assistant. Follow the user's instructions and the project's conventions.",
+			"supports_reasoning_summaries": false,
+			"support_verbosity":            false,
+			"supports_parallel_tool_calls": false,
+			"input_modalities":             []string{"text"},
+			"truncation_policy":            map[string]any{"mode": "tokens", "limit": 10000},
+			"experimental_supported_tools": []any{},
 		}
-		if profile == nil {
-			profile = map[string]any{
-				"slug":                         name,
-				"display_name":                 name,
-				"description":                  "Model available through New API",
-				"default_reasoning_level":      nil,
-				"supported_reasoning_levels":   []any{},
-				"shell_type":                   "unified_exec",
-				"base_instructions":            "You are a coding assistant. Follow the user's instructions and the project's conventions.",
-				"supports_reasoning_summaries": false,
-				"support_verbosity":            false,
-				"supports_parallel_tool_calls": false,
-				"input_modalities":             []string{"text"},
-				"truncation_policy":            map[string]any{"mode": "tokens", "limit": 10000},
-				"experimental_supported_tools": []any{},
-			}
-			if name == "step-5-preview" {
-				profile["default_reasoning_level"] = "medium"
-				profile["supported_reasoning_levels"] = []map[string]string{
-					{"effort": "low", "description": "Faster responses with lighter reasoning"},
-					{"effort": "medium", "description": "Balanced reasoning for everyday tasks"},
-					{"effort": "high", "description": "Deeper reasoning for complex tasks"},
-				}
-			}
-		}
+		maps.Copy(profile, profiles[name])
 		major, minor, family, known := codexReasoningModelParts(name)
 		if known {
-			knownEfforts := codexKnownReasoningEfforts(major, minor, family)
 			levels, ok := profile["supported_reasoning_levels"].([]any)
 			if !ok || len(levels) == 0 {
 				previousMinor := -1
@@ -368,16 +354,21 @@ func syncCodexModelCatalog(ctx context.Context, client *http.Client, baseURL, ke
 					previous, previousMinor = candidate, candidateMinor
 					levels, ok = candidateLevels, true
 				}
-				if previous != nil {
-					profile["supported_reasoning_levels"] = levels
-					if profile["default_reasoning_level"] == nil {
-						profile["default_reasoning_level"] = previous["default_reasoning_level"]
+				if previous == nil {
+					fallbackFamily := family
+					if fallbackFamily == "" {
+						fallbackFamily = "standard"
 					}
+					previous = profiles[managed.ReasoningFamilyDefaults[fallbackFamily]]
+					levels, ok = previous["supported_reasoning_levels"].([]any)
+				}
+				profile["supported_reasoning_levels"] = levels
+				if profile["default_reasoning_level"] == nil {
+					profile["default_reasoning_level"] = previous["default_reasoning_level"]
 				}
 			}
-			availableEfforts := knownEfforts
+			availableEfforts := make([]string, 0, len(levels))
 			if ok && len(levels) > 0 {
-				availableEfforts = make([]string, 0, len(levels))
 				for _, value := range levels {
 					level, valid := value.(map[string]any)
 					if !valid {
@@ -390,19 +381,7 @@ func syncCodexModelCatalog(ctx context.Context, client *http.Client, baseURL, ke
 					availableEfforts = append(availableEfforts, effort)
 				}
 			} else {
-				descriptions := map[string]string{
-					"none":   "No reasoning",
-					"low":    "Faster responses with lighter reasoning",
-					"medium": "Balanced reasoning for everyday tasks",
-					"high":   "Deeper reasoning for complex tasks",
-					"xhigh":  "Extended reasoning for difficult tasks",
-					"max":    "Maximum reasoning for the hardest tasks",
-				}
-				levels := make([]map[string]string, 0, len(knownEfforts))
-				for _, effort := range knownEfforts {
-					levels = append(levels, map[string]string{"effort": effort, "description": descriptions[effort]})
-				}
-				profile["supported_reasoning_levels"] = levels
+				return 0, false, errors.New("invalid catalog reasoning levels")
 			}
 			if selected, ok := profile["default_reasoning_level"].(string); !ok || !slices.Contains(availableEfforts, selected) {
 				if slices.Contains(availableEfforts, "medium") {
