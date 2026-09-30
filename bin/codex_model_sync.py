@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import signal
 import tempfile
 import threading
@@ -13,16 +14,8 @@ import urllib.parse
 import urllib.request
 
 
-DOCUMENTED_REASONING_EFFORTS = {
-    "gpt-5.5": ("none", "low", "medium", "high", "xhigh"),
-    "gpt-5.6": ("none", "low", "medium", "high", "xhigh", "max"),
-    "gpt-5.6-luna": ("none", "low", "medium", "high", "xhigh", "max"),
-    "gpt-5.6-sol": ("none", "low", "medium", "high", "xhigh", "max"),
-    "gpt-5.6-terra": ("none", "low", "medium", "high", "xhigh", "max"),
-    "gpt-6-astra": ("low", "medium", "high", "xhigh", "max"),
-    "gpt-6-luna": ("none", "low", "medium", "high", "xhigh", "max"),
-    "gpt-6-sol": ("none", "low", "medium", "high", "xhigh", "max"),
-}
+STANDARD_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
+GPT_MODEL_PATTERN = re.compile(r"gpt-(\d+)(?:\.(\d+))?(?:-(luna|sol|terra|astra))?")
 REASONING_EFFORT_DESCRIPTIONS = {
     "none": "No reasoning",
     "low": "Faster responses with lighter reasoning",
@@ -33,6 +26,34 @@ REASONING_EFFORT_DESCRIPTIONS = {
 }
 SYNC_INTERVAL = 4 * 60 * 60
 KEY_PLACEHOLDER = "REPLACE_WITH_NEW_API_KEY"
+
+
+def reasoning_model_parts(name):
+    match = GPT_MODEL_PATTERN.fullmatch(name)
+    if match is None:
+        return None
+    major = int(match.group(1))
+    minor = int(match.group(2) or 0)
+    family = match.group(3)
+    if major == 5 and minor == 5 and family is None:
+        return major, minor, family
+    if major == 5 and minor >= 6 and family in (None, "luna", "sol", "terra"):
+        return major, minor, family
+    if major >= 6:
+        return major, minor, family
+    return None
+
+
+def known_reasoning_efforts(parts):
+    """Provide defaults when no exact or earlier same-family catalog entry exists."""
+    major, minor, family = parts
+    if major == 5 and minor == 5:
+        return STANDARD_REASONING_EFFORTS[:-1]
+    if major == 5:
+        return STANDARD_REASONING_EFFORTS
+    if family == "astra":
+        return STANDARD_REASONING_EFFORTS[1:]
+    return STANDARD_REASONING_EFFORTS
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -129,13 +150,30 @@ def build_catalog(names, template):
                     {"effort": "medium", "description": "Balanced reasoning for everyday tasks"},
                     {"effort": "high", "description": "Deeper reasoning for complex tasks"},
                 ]
-        documented_efforts = DOCUMENTED_REASONING_EFFORTS.get(name)
-        if documented_efforts:
+        model_parts = reasoning_model_parts(name)
+        if model_parts is not None:
+            known_efforts = known_reasoning_efforts(model_parts)
             if not profile.get("supported_reasoning_levels"):
-                profile["supported_reasoning_levels"] = [
-                    {"effort": effort, "description": REASONING_EFFORT_DESCRIPTIONS[effort]}
-                    for effort in documented_efforts
-                ]
+                major, minor, family = model_parts
+                previous = None
+                previous_minor = -1
+                for slug, candidate in profiles.items():
+                    parts = reasoning_model_parts(slug)
+                    if parts is None or parts[0] != major or parts[2] != family:
+                        continue
+                    if parts[1] >= minor or parts[1] <= previous_minor:
+                        continue
+                    if candidate.get("supported_reasoning_levels"):
+                        previous, previous_minor = candidate, parts[1]
+                if previous is not None:
+                    profile["supported_reasoning_levels"] = copy.deepcopy(previous["supported_reasoning_levels"])
+                    if profile.get("default_reasoning_level") is None:
+                        profile["default_reasoning_level"] = previous.get("default_reasoning_level")
+                else:
+                    profile["supported_reasoning_levels"] = [
+                        {"effort": effort, "description": REASONING_EFFORT_DESCRIPTIONS[effort]}
+                        for effort in known_efforts
+                    ]
             available = [level["effort"] for level in profile["supported_reasoning_levels"]]
             if profile.get("default_reasoning_level") not in available:
                 profile["default_reasoning_level"] = "medium" if "medium" in available else available[0]

@@ -151,12 +151,17 @@ class ModelSyncTests(unittest.TestCase):
         )
         self.assertEqual(unknown["supported_reasoning_levels"], [])
 
-    def test_documented_gpt_efforts_fill_missing_template_levels(self):
+    def test_gpt_family_efforts_fill_new_versions_without_overriding_template(self):
         models = ["gpt-5.5", "gpt-5.6", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
-                  "gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-reserve"]
+                  "gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol",
+                  "gpt-6.2-sol", "gpt-6.1-astra", "gpt-6.1-image", "gpt-reserve"]
+        sol_levels = [{"effort": effort, "description": f"Custom {effort}"}
+                      for effort in ("low", "medium", "high", "xhigh", "max", "ultra")]
         template = {"models": [
             {"slug": "gpt-6-astra", "default_reasoning_level": "none",
              "supported_reasoning_levels": []},
+            {"slug": "gpt-6-sol", "default_reasoning_level": "low",
+             "supported_reasoning_levels": sol_levels},
             {"slug": "gpt-5.6", "default_reasoning_level": "none",
              "supported_reasoning_levels": [{"effort": "high", "description": "Custom"}]},
             {"slug": "gpt-reserve", "default_reasoning_level": "high",
@@ -165,11 +170,15 @@ class ModelSyncTests(unittest.TestCase):
         catalog = {model["slug"]: model for model in build_catalog(models, template)["models"]}
         self.assertEqual([level["effort"] for level in catalog["gpt-5.5"]["supported_reasoning_levels"]],
                          ["none", "low", "medium", "high", "xhigh"])
-        for name in ("gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
-                     "gpt-6-luna", "gpt-6-sol"):
+        for name in ("gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-luna"):
             self.assertEqual([level["effort"] for level in catalog[name]["supported_reasoning_levels"]],
                              ["none", "low", "medium", "high", "xhigh", "max"])
+        for name in ("gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol"):
+            self.assertEqual(catalog[name]["supported_reasoning_levels"], sol_levels)
+            self.assertEqual(catalog[name]["default_reasoning_level"], "low")
         self.assertEqual([level["effort"] for level in catalog["gpt-6-astra"]["supported_reasoning_levels"]],
+                         ["low", "medium", "high", "xhigh", "max"])
+        self.assertEqual([level["effort"] for level in catalog["gpt-6.1-astra"]["supported_reasoning_levels"]],
                          ["low", "medium", "high", "xhigh", "max"])
         self.assertEqual(catalog["gpt-6-astra"]["default_reasoning_level"], "medium")
         self.assertEqual([level["effort"] for level in catalog["gpt-5.6"]["supported_reasoning_levels"]],
@@ -177,6 +186,7 @@ class ModelSyncTests(unittest.TestCase):
         self.assertEqual(catalog["gpt-5.6"]["default_reasoning_level"], "high")
         self.assertEqual(catalog["gpt-reserve"]["supported_reasoning_levels"],
                          [{"effort": "high", "description": "Custom"}])
+        self.assertEqual(catalog["gpt-6.1-image"]["supported_reasoning_levels"], [])
 
     def test_failure_preserves_catalog_and_success_timestamp(self):
         sync_once(self.base_url, self.key, self.output)

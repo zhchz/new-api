@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -28,6 +30,8 @@ var errCodexGatewayModelsPending = errors.New("gateway has no usable models for 
 var errCodexGatewayUnauthorized = errors.New("gateway key is not authorized")
 
 const codexModelSyncEnabledFile = "auto-sync-enabled"
+
+var codexKnownGPTModelPattern = regexp.MustCompile(`^gpt-(\d+)(?:\.(\d+))?(?:-(luna|sol|terra|astra))?$`)
 
 // Codex launchers call this after the gateway key and channels are configured.
 // The readiness mode never writes a catalog or activates automatic sync.
@@ -236,6 +240,46 @@ func fetchCodexGatewayModelNames(ctx context.Context, client *http.Client, baseU
 	return modelNames, nil
 }
 
+// codexReasoningModelParts identifies the version and known reasoning family.
+func codexReasoningModelParts(name string) (major, minor int, family string, known bool) {
+	parts := codexKnownGPTModelPattern.FindStringSubmatch(name)
+	if parts == nil {
+		return 0, 0, "", false
+	}
+	major, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, "", false
+	}
+	if parts[2] != "" {
+		minor, err = strconv.Atoi(parts[2])
+		if err != nil {
+			return 0, 0, "", false
+		}
+	}
+	family = parts[3]
+	known = major == 5 && minor == 5 && family == "" ||
+		major == 5 && minor >= 6 && family != "astra" || major >= 6
+	return major, minor, family, known
+}
+
+// codexKnownReasoningEfforts supplies defaults when the catalog has no exact
+// or earlier same-family reasoning configuration.
+func codexKnownReasoningEfforts(major, minor int, family string) []string {
+	standard := []string{"none", "low", "medium", "high", "xhigh", "max"}
+	switch {
+	case major == 5 && minor == 5 && family == "":
+		return standard[:len(standard)-1]
+	case major == 5 && minor >= 6 && family != "astra":
+		return standard
+	case major >= 6 && family == "astra":
+		return standard[1:]
+	case major >= 6:
+		return standard
+	default:
+		return nil
+	}
+}
+
 func syncCodexModelCatalog(ctx context.Context, client *http.Client, baseURL, keyPath, templatePath, outputPath string) (int, bool, error) {
 	modelNames, err := fetchCodexGatewayModelNames(ctx, client, baseURL, keyPath)
 	if err != nil {
@@ -274,6 +318,11 @@ func syncCodexModelCatalog(ctx context.Context, client *http.Client, baseURL, ke
 	models := make([]map[string]any, 0, len(modelNames))
 	for priority, name := range modelNames {
 		profile := profiles[name]
+		if profile != nil {
+			copy := make(map[string]any, len(profile))
+			maps.Copy(copy, profile)
+			profile = copy
+		}
 		if profile == nil {
 			profile = map[string]any{
 				"slug":                         name,
@@ -299,19 +348,34 @@ func syncCodexModelCatalog(ctx context.Context, client *http.Client, baseURL, ke
 				}
 			}
 		}
-		var documentedEfforts []string
-		switch name {
-		case "gpt-5.5":
-			documentedEfforts = []string{"none", "low", "medium", "high", "xhigh"}
-		case "gpt-5.6", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
-			"gpt-6-luna", "gpt-6-sol":
-			documentedEfforts = []string{"none", "low", "medium", "high", "xhigh", "max"}
-		case "gpt-6-astra":
-			documentedEfforts = []string{"low", "medium", "high", "xhigh", "max"}
-		}
-		if len(documentedEfforts) > 0 {
+		major, minor, family, known := codexReasoningModelParts(name)
+		if known {
+			knownEfforts := codexKnownReasoningEfforts(major, minor, family)
 			levels, ok := profile["supported_reasoning_levels"].([]any)
-			availableEfforts := documentedEfforts
+			if !ok || len(levels) == 0 {
+				previousMinor := -1
+				var previous map[string]any
+				for slug, candidate := range profiles {
+					candidateMajor, candidateMinor, candidateFamily, candidateKnown := codexReasoningModelParts(slug)
+					if !candidateKnown || candidateMajor != major || candidateFamily != family ||
+						candidateMinor >= minor || candidateMinor <= previousMinor {
+						continue
+					}
+					candidateLevels, valid := candidate["supported_reasoning_levels"].([]any)
+					if !valid || len(candidateLevels) == 0 {
+						continue
+					}
+					previous, previousMinor = candidate, candidateMinor
+					levels, ok = candidateLevels, true
+				}
+				if previous != nil {
+					profile["supported_reasoning_levels"] = levels
+					if profile["default_reasoning_level"] == nil {
+						profile["default_reasoning_level"] = previous["default_reasoning_level"]
+					}
+				}
+			}
+			availableEfforts := knownEfforts
 			if ok && len(levels) > 0 {
 				availableEfforts = make([]string, 0, len(levels))
 				for _, value := range levels {
@@ -334,8 +398,8 @@ func syncCodexModelCatalog(ctx context.Context, client *http.Client, baseURL, ke
 					"xhigh":  "Extended reasoning for difficult tasks",
 					"max":    "Maximum reasoning for the hardest tasks",
 				}
-				levels := make([]map[string]string, 0, len(documentedEfforts))
-				for _, effort := range documentedEfforts {
+				levels := make([]map[string]string, 0, len(knownEfforts))
+				for _, effort := range knownEfforts {
 					levels = append(levels, map[string]string{"effort": effort, "description": descriptions[effort]})
 				}
 				profile["supported_reasoning_levels"] = levels
