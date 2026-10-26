@@ -105,8 +105,8 @@ def fetch_models(base_url, api_key_file):
                 not isinstance(endpoint, str) for endpoint in endpoints
             ):
                 raise ValueError("invalid model endpoint list")
-            if endpoints and "openai-response" not in endpoints:
-                continue
+        # Native endpoint metadata does not describe gateway-side conversions.
+        # Keep every model exposed to this key in the client catalog.
         names.add(name)
     if not names:
         raise ValueError("no usable models are available for this key")

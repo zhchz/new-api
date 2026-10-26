@@ -21,7 +21,7 @@ import (
 func TestSyncCodexModelCatalog(t *testing.T) {
 	var mu sync.Mutex
 	status := http.StatusOK
-	payload := `{"data":[{"id":"model-b"},{"id":"model-a"},{"id":"model-b"},{"id":"image","supported_endpoint_types":["image-generation"]},{"id":"step-5-preview","supported_endpoint_types":["openai-response"]}]}`
+	payload := `{"data":[{"id":"model-b"},{"id":"model-a"},{"id":"model-b"},{"id":"image","supported_endpoint_types":["image-generation"]},{"id":"step-5-preview","supported_endpoint_types":["openai-response"]},{"id":"deepseek-flash","supported_endpoint_types":["openai"]},{"id":"deepseek-v4-pro","supported_endpoint_types":["openai"]}]}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/v1/models", r.URL.Path)
 		assert.Equal(t, "Bearer test-gateway-token", r.Header.Get("Authorization"))
@@ -49,7 +49,7 @@ func TestSyncCodexModelCatalog(t *testing.T) {
 
 	count, changed, err := syncCodexModelCatalog(context.Background(), server.Client(), baseURL, keyPath, templatePath, outputPath)
 	require.NoError(t, err)
-	assert.Equal(t, 3, count)
+	assert.Equal(t, 6, count)
 	assert.True(t, changed)
 	first, err := os.ReadFile(outputPath)
 	require.NoError(t, err)
@@ -58,21 +58,26 @@ func TestSyncCodexModelCatalog(t *testing.T) {
 		Models []map[string]any `json:"models"`
 	}
 	require.NoError(t, common.Unmarshal(first, &catalog))
-	require.Len(t, catalog.Models, 3)
-	assert.Equal(t, []string{"model-a", "model-b", "step-5-preview"}, []string{
-		catalog.Models[0]["slug"].(string), catalog.Models[1]["slug"].(string), catalog.Models[2]["slug"].(string),
-	})
-	assert.Equal(t, float64(12345), catalog.Models[0]["context_window"])
-	assert.Equal(t, "list", catalog.Models[0]["visibility"])
-	assert.Equal(t, true, catalog.Models[0]["supported_in_api"])
-	assert.Equal(t, "medium", catalog.Models[2]["default_reasoning_level"])
+	require.Len(t, catalog.Models, 6)
+	names := make([]string, 0, len(catalog.Models))
+	profiles := make(map[string]map[string]any, len(catalog.Models))
+	for _, profile := range catalog.Models {
+		name := profile["slug"].(string)
+		names = append(names, name)
+		profiles[name] = profile
+		assert.Equal(t, "list", profile["visibility"])
+		assert.Equal(t, true, profile["supported_in_api"])
+	}
+	assert.Equal(t, []string{"deepseek-flash", "deepseek-v4-pro", "image", "model-a", "model-b", "step-5-preview"}, names)
+	assert.Equal(t, float64(12345), profiles["model-a"]["context_window"])
+	assert.Equal(t, "medium", profiles["step-5-preview"]["default_reasoning_level"])
 	assert.FileExists(t, filepath.Join(filepath.Dir(outputPath), "models.last-success"))
 
 	info, err := os.Stat(outputPath)
 	require.NoError(t, err)
 	count, changed, err = syncCodexModelCatalog(context.Background(), server.Client(), baseURL, keyPath, templatePath, outputPath)
 	require.NoError(t, err)
-	assert.Equal(t, 3, count)
+	assert.Equal(t, 6, count)
 	assert.False(t, changed)
 	unchanged, err := os.Stat(outputPath)
 	require.NoError(t, err)

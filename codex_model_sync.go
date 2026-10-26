@@ -217,20 +217,14 @@ func fetchCodexGatewayModelNames(ctx context.Context, client *http.Client, baseU
 			if !ok {
 				return nil, errors.New("invalid gateway model endpoints")
 			}
-			supported := len(endpoints) == 0
 			for _, value := range endpoints {
-				endpoint, ok := value.(string)
-				if !ok {
+				if _, ok := value.(string); !ok {
 					return nil, errors.New("invalid gateway model endpoints")
 				}
-				if endpoint == "openai-response" {
-					supported = true
-				}
-			}
-			if !supported {
-				continue
 			}
 		}
+		// Native endpoints do not account for gateway-side protocol conversion.
+		// Keep every model exposed to this key in the client catalog.
 		names[name] = struct{}{}
 	}
 	modelNames := make([]string, 0, len(names))

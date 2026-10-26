@@ -113,15 +113,36 @@ class ModelSyncTests(unittest.TestCase):
         self.assertEqual(due.returncode, 0, due.stderr)
         self.assertEqual(len(self.server.requests), 2)
 
-    def test_only_advertised_responses_or_unspecified_endpoints(self):
+    def test_each_sync_publishes_new_gateway_models_regardless_of_endpoints(self):
+        sync_once(self.base_url, self.key, self.output)
         self.server.payload = {"data": [
-            {"id": "responses", "supported_endpoint_types": ["openai-response"]},
+            {"id": "deepseek-flash", "supported_endpoint_types": ["openai"]},
+            {"id": "deepseek-v4-pro", "supported_endpoint_types": ["openai"]},
+            {"id": "claude", "supported_endpoint_types": ["anthropic"]},
+            {"id": "gemini", "supported_endpoint_types": ["gemini"]},
             {"id": "image", "supported_endpoint_types": ["image-generation"]},
+            {"id": "responses", "supported_endpoint_types": ["openai-response"]},
             {"id": "legacy"},
             {"id": "unspecified", "supported_endpoint_types": []},
         ]}
-        sync_once(self.base_url, self.key, self.output)
-        self.assertEqual([model["slug"] for model in json.loads(self.output.read_text())["models"]], ["legacy", "responses", "unspecified"])
+        self.assertEqual(sync_once(self.base_url, self.key, self.output), (8, True))
+        models = json.loads(self.output.read_text())["models"]
+        self.assertEqual([model["slug"] for model in models], [
+            "claude", "deepseek-flash", "deepseek-v4-pro", "gemini",
+            "image", "legacy", "responses", "unspecified",
+        ])
+        for model in models:
+            with self.subTest(model=model["slug"]):
+                self.assertEqual(model["visibility"], "list")
+                self.assertTrue(model["supported_in_api"])
+        self.server.payload = {"data": [
+            {"id": "deepseek-v4-pro", "supported_endpoint_types": ["openai"]},
+        ]}
+        self.assertEqual(sync_once(self.base_url, self.key, self.output), (1, True))
+        self.assertEqual(
+            [model["slug"] for model in json.loads(self.output.read_text())["models"]],
+            ["deepseek-v4-pro"],
+        )
 
     def test_preserves_exact_model_metadata_without_copying_to_unknown_models(self):
         template = {"models": [{
