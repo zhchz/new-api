@@ -300,6 +300,7 @@ func syncCodexModelCatalog(ctx context.Context, client *http.Client, baseURL, ke
 	var managed struct {
 		Models                  []map[string]any  `json:"models"`
 		ReasoningFamilyDefaults map[string]string `json:"reasoning_family_defaults"`
+		DefaultReasoningProfile map[string]any    `json:"default_reasoning_profile"`
 	}
 	if err := common.Unmarshal(codexReasoningTemplate, &managed); err != nil {
 		return 0, false, errors.New("invalid bundled catalog template")
@@ -361,30 +362,43 @@ func syncCodexModelCatalog(ctx context.Context, client *http.Client, baseURL, ke
 					profile["default_reasoning_level"] = previous["default_reasoning_level"]
 				}
 			}
-			availableEfforts := make([]string, 0, len(levels))
-			if ok && len(levels) > 0 {
-				for _, value := range levels {
-					level, valid := value.(map[string]any)
-					if !valid {
-						return 0, false, errors.New("invalid catalog reasoning level")
-					}
-					effort, valid := level["effort"].(string)
-					if !valid || effort == "" {
-						return 0, false, errors.New("invalid catalog reasoning level")
-					}
-					availableEfforts = append(availableEfforts, effort)
-				}
-			} else {
-				return 0, false, errors.New("invalid catalog reasoning levels")
+		}
+		// New and previously generated models receive selectable client levels,
+		// without replacing a model's explicit or inherited reasoning profile.
+		levels, ok := profile["supported_reasoning_levels"].([]any)
+		if !ok {
+			return 0, false, errors.New("invalid catalog reasoning levels")
+		}
+		if len(levels) == 0 {
+			levels, ok = managed.DefaultReasoningProfile["supported_reasoning_levels"].([]any)
+			if !ok || len(levels) == 0 {
+				return 0, false, errors.New("invalid bundled default reasoning levels")
 			}
-			if selected, ok := profile["default_reasoning_level"].(string); !ok || !slices.Contains(availableEfforts, selected) {
-				if slices.Contains(availableEfforts, "medium") {
-					profile["default_reasoning_level"] = "medium"
-				} else {
-					profile["default_reasoning_level"] = availableEfforts[0]
-				}
+			profile["supported_reasoning_levels"] = levels
+			if profile["default_reasoning_level"] == nil {
+				profile["default_reasoning_level"] = managed.DefaultReasoningProfile["default_reasoning_level"]
 			}
 		}
+		availableEfforts := make([]string, 0, len(levels))
+		for _, value := range levels {
+			level, valid := value.(map[string]any)
+			if !valid {
+				return 0, false, errors.New("invalid catalog reasoning level")
+			}
+			effort, valid := level["effort"].(string)
+			if !valid || effort == "" {
+				return 0, false, errors.New("invalid catalog reasoning level")
+			}
+			availableEfforts = append(availableEfforts, effort)
+		}
+		if selected, ok := profile["default_reasoning_level"].(string); !ok || !slices.Contains(availableEfforts, selected) {
+			if slices.Contains(availableEfforts, "medium") {
+				profile["default_reasoning_level"] = "medium"
+			} else {
+				profile["default_reasoning_level"] = availableEfforts[0]
+			}
+		}
+
 		profile["visibility"] = "list"
 		profile["supported_in_api"] = true
 		profile["priority"] = priority

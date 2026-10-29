@@ -8,6 +8,32 @@
   },
   "models": [
     {
+      "slug": "chatgpt-web",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "none",
+          "description": "ChatGPT web: Instant (即时)"
+        },
+        {
+          "effort": "medium",
+          "description": "ChatGPT web: Medium (中等)"
+        },
+        {
+          "effort": "high",
+          "description": "ChatGPT web: High (高)"
+        },
+        {
+          "effort": "xhigh",
+          "description": "ChatGPT web: Extra High (超高)"
+        },
+        {
+          "effort": "max",
+          "description": "ChatGPT web: Pro"
+        }
+      ]
+    },
+    {
       "slug": "codex-auto-review",
       "default_reasoning_level": "medium",
       "supported_reasoning_levels": [
@@ -401,5 +427,22 @@
         }
       ]
     }
-  ]
+  ],
+  "default_reasoning_profile": {
+    "default_reasoning_level": "medium",
+    "supported_reasoning_levels": [
+      {
+        "effort": "low",
+        "description": "Faster responses with lighter reasoning"
+      },
+      {
+        "effort": "medium",
+        "description": "Balanced reasoning for everyday tasks"
+      },
+      {
+        "effort": "high",
+        "description": "Deeper reasoning for complex tasks"
+      }
+    ]
+  }
 }

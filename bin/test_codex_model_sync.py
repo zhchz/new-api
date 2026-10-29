@@ -54,6 +54,10 @@ class ModelSyncTests(unittest.TestCase):
         self.assertEqual(sync_once(self.base_url, self.key, self.output), (2, True))
         catalog = json.loads(self.output.read_text())
         self.assertEqual([model["slug"] for model in catalog["models"]], ["model-a", "model-b"])
+        for model in catalog["models"]:
+            self.assertEqual(model["default_reasoning_level"], "medium")
+            self.assertEqual([level["effort"] for level in model["supported_reasoning_levels"]],
+                             ["low", "medium", "high"])
         self.assertEqual(self.server.requests, [("/v1/models", "Bearer test-gateway-token")])
         self.assertEqual(self.output.stat().st_mode & 0o777, 0o600)
         self.assertNotIn("test-gateway-token", self.output.read_text())
@@ -63,7 +67,10 @@ class ModelSyncTests(unittest.TestCase):
         self.assertEqual(self.output.stat().st_mtime_ns, modified)
         self.server.payload = {"data": [{"id": "model-c"}]}
         sync_once(self.base_url, self.key, self.output)
-        self.assertEqual([model["slug"] for model in json.loads(self.output.read_text())["models"]], ["model-c"])
+        added = json.loads(self.output.read_text())["models"]
+        self.assertEqual([model["slug"] for model in added], ["model-c"])
+        self.assertEqual([level["effort"] for level in added[0]["supported_reasoning_levels"]],
+                         ["low", "medium", "high"])
         self.server.payload = {"data": []}
         with self.assertRaisesRegex(ValueError, "no usable models"):
             sync_once(self.base_url, self.key, self.output)
@@ -159,7 +166,8 @@ class ModelSyncTests(unittest.TestCase):
         self.assertEqual(known["visibility"], "list")
         self.assertTrue(known["supported_in_api"])
         self.assertNotIn("context_window", unknown)
-        self.assertEqual(unknown["supported_reasoning_levels"], [])
+        self.assertEqual([level["effort"] for level in unknown["supported_reasoning_levels"]],
+                         ["low", "medium", "high"])
         known["custom"]["value"] = 2
         self.assertEqual(template, original)
 
@@ -171,7 +179,8 @@ class ModelSyncTests(unittest.TestCase):
             [level["effort"] for level in step["supported_reasoning_levels"]],
             ["low", "medium", "high"],
         )
-        self.assertEqual(unknown["supported_reasoning_levels"], [])
+        self.assertEqual([level["effort"] for level in unknown["supported_reasoning_levels"]],
+                         ["low", "medium", "high"])
 
     def test_managed_reasoning_repairs_stale_templates_and_preserves_metadata(self):
         names = [model["slug"] for model in REASONING_TEMPLATE["models"]]
@@ -204,6 +213,24 @@ class ModelSyncTests(unittest.TestCase):
             self.assertEqual([level["effort"] for level in repaired[name]["supported_reasoning_levels"]],
                              ["low", "medium", "high"])
 
+    def test_chatgpt_web_repairs_empty_reasoning_and_matches_the_web_picker(self):
+        self.server.payload = {"data": [{"id": "chatgpt-web"}]}
+        self.output.parent.mkdir(parents=True)
+        self.output.write_text(json.dumps({"models": [{
+            "slug": "chatgpt-web", "default_reasoning_level": None,
+            "supported_reasoning_levels": [], "context_window": 128000,
+        }]}))
+        sync_once(self.base_url, self.key, self.output)
+        model = json.loads(self.output.read_text())["models"][0]
+        self.assertEqual(model["context_window"], 128000)
+        self.assertEqual(model["default_reasoning_level"], "medium")
+        self.assertEqual([level["effort"] for level in model["supported_reasoning_levels"]],
+                         ["none", "medium", "high", "xhigh", "max"])
+        for level, label in zip(model["supported_reasoning_levels"],
+                                ["Instant", "Medium", "High", "Extra High", "Pro"]):
+            self.assertIn(label, level["description"])
+        self.assertEqual(sync_once(self.base_url, self.key, self.output), (1, False))
+
     def test_new_versions_inherit_the_latest_repaired_family_profile(self):
         template = {"models": [
             {"slug": "gpt-6-sol", "default_reasoning_level": "none",
@@ -224,7 +251,8 @@ class ModelSyncTests(unittest.TestCase):
         for name in ("gpt-5.6", "unknown"):
             self.assertEqual(catalog[name]["supported_reasoning_levels"],
                              [{"effort": "high", "description": "Custom"}])
-        self.assertEqual(catalog["gpt-6.1-image"]["supported_reasoning_levels"], [])
+        self.assertEqual([level["effort"] for level in catalog["gpt-6.1-image"]["supported_reasoning_levels"]],
+                         ["low", "medium", "high"])
 
     def test_missing_template_preserves_metadata_from_the_previous_catalog(self):
         self.server.payload = {"data": [{"id": "gpt-6-sol"}, {"id": "unknown"}]}
@@ -237,7 +265,8 @@ class ModelSyncTests(unittest.TestCase):
         models = json.loads(self.output.read_text())["models"]
         self.assertEqual(models[0]["context_window"], 123456)
         self.assertIn("ultra", [level["effort"] for level in models[0]["supported_reasoning_levels"]])
-        self.assertEqual(models[1]["supported_reasoning_levels"], [])
+        self.assertEqual([level["effort"] for level in models[1]["supported_reasoning_levels"]],
+                         ["low", "medium", "high"])
 
     def test_failure_preserves_catalog_and_success_timestamp(self):
         sync_once(self.base_url, self.key, self.output)

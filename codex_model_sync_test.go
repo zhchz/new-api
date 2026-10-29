@@ -137,7 +137,7 @@ func TestCodexModelSyncDelay(t *testing.T) {
 
 func TestSyncCodexModelCatalogAddsReasoningEffortsForNewFamilyVersions(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"data":[{"id":"gpt-5.5"},{"id":"gpt-5.6"},{"id":"gpt-5.6-luna"},{"id":"gpt-6-astra"},{"id":"gpt-6-sol"},{"id":"gpt-6.1-sol"},{"id":"gpt-6.2-sol"},{"id":"gpt-6.1-astra"},{"id":"gpt-6.1-image"},{"id":"model-custom"}]}`))
+		_, _ = w.Write([]byte(`{"data":[{"id":"gpt-5.5"},{"id":"gpt-5.6"},{"id":"gpt-5.6-luna"},{"id":"gpt-6-astra"},{"id":"gpt-6-sol"},{"id":"gpt-6.1-sol"},{"id":"gpt-6.2-sol"},{"id":"gpt-6.1-astra"},{"id":"gpt-6.1-image"},{"id":"model-custom"},{"id":"chatgpt-web"},{"id":"brand-new-model"}]}`))
 	}))
 	defer server.Close()
 	root := t.TempDir()
@@ -148,7 +148,7 @@ func TestSyncCodexModelCatalogAddsReasoningEffortsForNewFamilyVersions(t *testin
 	count, changed, err := syncCodexModelCatalog(context.Background(), server.Client(), server.URL+"/v1", keyPath, filepath.Join(root, "missing-template.json"), outputPath)
 	require.NoError(t, err)
 	assert.True(t, changed)
-	assert.Equal(t, 10, count)
+	assert.Equal(t, 12, count)
 	content, err := os.ReadFile(outputPath)
 	require.NoError(t, err)
 	var catalog struct {
@@ -171,7 +171,9 @@ func TestSyncCodexModelCatalogAddsReasoningEffortsForNewFamilyVersions(t *testin
 		{"gpt-6.1-sol", []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
 		{"gpt-6.2-sol", []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
 		{"gpt-6.1-astra", []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
-		{"gpt-6.1-image", []string{}},
+		{"gpt-6.1-image", []string{"low", "medium", "high"}},
+		{"chatgpt-web", []string{"none", "medium", "high", "xhigh", "max"}},
+		{"brand-new-model", []string{"low", "medium", "high"}},
 		{"model-custom", []string{"high"}},
 	}
 	for _, test := range cases {
@@ -181,6 +183,9 @@ func TestSyncCodexModelCatalogAddsReasoningEffortsForNewFamilyVersions(t *testin
 		}
 		assert.Equal(t, test.efforts, efforts, test.name)
 	}
+	assert.Equal(t, "medium", byName["chatgpt-web"]["default_reasoning_level"])
+	assert.Equal(t, "medium", byName["brand-new-model"]["default_reasoning_level"])
+	assert.Equal(t, "ChatGPT web: Pro", byName["chatgpt-web"]["supported_reasoning_levels"].([]any)[4].(map[string]any)["description"])
 	assert.Equal(t, "low", byName["gpt-6-astra"]["default_reasoning_level"])
 	assert.Equal(t, "medium", byName["gpt-6.1-sol"]["default_reasoning_level"])
 	assert.Equal(t, "Ultra reasoning for the most demanding tasks", byName["gpt-6.1-sol"]["supported_reasoning_levels"].([]any)[5].(map[string]any)["description"])

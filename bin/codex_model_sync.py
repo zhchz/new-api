@@ -157,15 +157,25 @@ def build_catalog(names, template):
                     profile["supported_reasoning_levels"] = copy.deepcopy(fallback["supported_reasoning_levels"])
                     if profile.get("default_reasoning_level") is None:
                         profile["default_reasoning_level"] = fallback["default_reasoning_level"]
-            levels = profile["supported_reasoning_levels"]
-            if not isinstance(levels, list) or any(
-                not isinstance(level, dict) or not isinstance(level.get("effort"), str) or not level["effort"]
-                for level in levels
-            ):
-                raise ValueError("invalid catalog reasoning level")
-            available = [level["effort"] for level in levels]
-            if profile.get("default_reasoning_level") not in available:
-                profile["default_reasoning_level"] = "medium" if "medium" in available else available[0]
+        # Every generated model needs selectable client levels. Explicit model
+        # profiles and inherited GPT family capabilities take priority.
+        levels = profile["supported_reasoning_levels"]
+        if not isinstance(levels, list):
+            raise ValueError("invalid catalog reasoning levels")
+        if not levels:
+            fallback = REASONING_TEMPLATE["default_reasoning_profile"]
+            levels = copy.deepcopy(fallback["supported_reasoning_levels"])
+            profile["supported_reasoning_levels"] = levels
+            if profile.get("default_reasoning_level") is None:
+                profile["default_reasoning_level"] = fallback["default_reasoning_level"]
+        if any(
+            not isinstance(level, dict) or not isinstance(level.get("effort"), str) or not level["effort"]
+            for level in levels
+        ):
+            raise ValueError("invalid catalog reasoning level")
+        available = [level["effort"] for level in levels]
+        if profile.get("default_reasoning_level") not in available:
+            profile["default_reasoning_level"] = "medium" if "medium" in available else available[0]
         profile.update(visibility="list", supported_in_api=True, priority=priority)
         models.append(profile)
     return {"models": models}
